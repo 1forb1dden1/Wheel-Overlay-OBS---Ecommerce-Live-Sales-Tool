@@ -1,0 +1,746 @@
+<!DOCTYPE html>
+<!--
+  OBS Browser Source — Energy Break wheel (minimal: strip + spot only).
+  • URL: http://127.0.0.1:<port>/ — port is printed in the desktop app log.
+  • Transparent page background; enable browser-source transparency in OBS if needed.
+-->
+<html lang="en">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1" />
+  <meta name="color-scheme" content="dark" />
+  <title>OBS — Wheel</title>
+  <style>
+    :root {
+      --panel: #0c1220;
+      --panel-2: #111b2e;
+      --panel-edge: #1e293b;
+      --slot-bg: #1a2744;
+      --slot-bd: #334155;
+      --fg: #e2e8f0;
+      --win-bg: #4f46e5;
+      --win-fg: #f8fafc;
+      --win-ring: #a5b4fc;
+      --pointer: #fbbf24;
+      --pointer-edge: #0f172a;
+      --track: #273549;
+      --title: #ffd93d;
+      --accent: #ff6b6b;
+      --pad-top: 28px;
+      --pad-bottom: 14px;
+      --cell-w: 127px;
+      --gap: 2.5px;
+      --pl: 0px;
+      --island-pad: clamp(4px, 1vmin, 10px);
+      --font: "Segoe UI", system-ui, -apple-system, "Segoe UI Variable", sans-serif;
+    }
+
+    *, *::before, *::after { box-sizing: border-box; }
+
+    html, body {
+      margin: 0;
+      width: 100%;
+      height: 100%;
+      background: transparent !important;
+      color: var(--fg);
+      font-family: var(--font);
+      overflow: hidden;
+      -webkit-font-smoothing: antialiased;
+    }
+
+    #app {
+      min-height: 100%;
+      min-height: 100dvh;
+      display: flex;
+      align-items: center;
+      justify-content: center;
+      padding: var(--island-pad);
+      background: transparent !important;
+    }
+
+    .obs-island {
+      width: 100%;
+      max-width: 100%;
+      height: min(97dvh, 97vh);
+      max-height: none;
+      min-height: 0;
+      display: flex;
+      flex-direction: column;
+      border-radius: clamp(10px, 1.2vmin, 16px);
+      background: linear-gradient(180deg, var(--panel) 0%, var(--panel-2) 100%);
+      border: 1px solid var(--panel-edge);
+      box-shadow: 0 0 0 1px rgba(0, 0, 0, 0.45), 0 16px 40px rgba(0, 0, 0, 0.45);
+      overflow: hidden;
+    }
+
+    .wheel-heading-stack {
+      flex: 0 0 auto;
+      display: grid;
+      grid-template-columns: 1fr auto 1fr;
+      align-items: start;
+      column-gap: clamp(6px, 1.5vmin, 12px);
+      padding: clamp(2px, 0.6vmin, 8px) clamp(8px, 2vmin, 14px) clamp(2px, 0.75vmin, 8px);
+      min-width: 0;
+    }
+
+    .wheel-heading-spacer {
+      grid-column: 1;
+      min-width: 0;
+    }
+
+    .wheel-heading {
+      grid-column: 2;
+      justify-self: center;
+      margin: 0;
+      padding: 0;
+      max-width: 100%;
+      font-family: var(--font);
+      font-size: clamp(1.51rem, 3.74vmin, 2.09rem);
+      font-weight: 800;
+      letter-spacing: 0.05em;
+      text-align: center;
+      color: var(--title);
+      text-shadow: 0 1px 3px rgba(0, 0, 0, 0.7);
+    }
+
+    .obs-stage-wrap {
+      flex: 1 1 auto;
+      min-height: 0;
+      padding: clamp(4px, 0.75vmin, 8px);
+      display: flex;
+      flex-direction: column;
+    }
+
+    #viewport {
+      position: relative;
+      flex: 1 1 auto;
+      min-height: clamp(192px, 38.4vmin, 504px);
+      border-radius: clamp(8px, 1vmin, 14px);
+      overflow: hidden;
+      background:
+        radial-gradient(ellipse 100% 90% at 50% 100%, rgba(79, 70, 229, 0.12) 0%, transparent 55%),
+        linear-gradient(185deg, #080c14 0%, #0f172a 50%, #101c30 100%);
+      border: 1px solid rgba(30, 41, 59, 0.95);
+    }
+
+    #prizes-left-badge {
+      grid-column: 3;
+      justify-self: end;
+      align-self: start;
+      flex: 0 1 auto;
+      position: static;
+      z-index: auto;
+      max-width: min(100%, 18rem);
+      padding: 6px 14px 7px;
+      border-radius: 999px;
+      font-size: clamp(1.27rem, 2.95vmin, 1.51rem);
+      font-weight: 700;
+      letter-spacing: 0.03em;
+      color: var(--title);
+      text-shadow: 0 1px 2px rgba(0, 0, 0, 0.65);
+      background: rgba(8, 12, 20, 0.72);
+      border: 1px solid rgba(251, 191, 36, 0.28);
+      pointer-events: none;
+      line-height: 1.25;
+      box-shadow: 0 2px 8px rgba(0, 0, 0, 0.35);
+      box-sizing: border-box;
+      text-align: right;
+    }
+
+    .pointer-wrap {
+      position: absolute;
+      left: 50%;
+      top: 3px;
+      transform: translateX(-50%);
+      z-index: 8;
+      filter: drop-shadow(0 2px 4px rgba(0, 0, 0, 0.55));
+    }
+
+    .pointer-wrap svg {
+      display: block;
+      width: clamp(30px, 4.2vmin, 44px);
+      height: auto;
+    }
+
+    .rail-glow {
+      position: absolute;
+      left: 8%;
+      right: 8%;
+      bottom: 5px;
+      height: clamp(10px, 2vmin, 16px);
+      z-index: 2;
+      background: radial-gradient(ellipse 70% 100% at 50% 100%, rgba(79, 70, 229, 0.16) 0%, transparent 72%);
+      pointer-events: none;
+    }
+
+    .rail {
+      position: absolute;
+      left: clamp(6px, 1.2vmin, 14px);
+      right: clamp(6px, 1.2vmin, 14px);
+      bottom: 8px;
+      height: 2px;
+      z-index: 3;
+      border-radius: 2px;
+      background: linear-gradient(
+        90deg,
+        transparent 0%,
+        var(--track) 12%,
+        rgba(148, 163, 184, 0.4) 50%,
+        var(--track) 88%,
+        transparent 100%
+      );
+    }
+
+    #strip-wrap {
+      position: absolute;
+      left: 0;
+      right: 0;
+      top: var(--pad-top);
+      bottom: var(--pad-bottom);
+      overflow: hidden;
+      transform: translateZ(0);
+      backface-visibility: hidden;
+      mask-image: linear-gradient(90deg, transparent 0%, #000 1.5%, #000 98.5%, transparent 100%);
+      -webkit-mask-image: linear-gradient(90deg, transparent 0%, #000 1.5%, #000 98.5%, transparent 100%);
+    }
+
+    #strip {
+      display: flex;
+      flex-direction: row;
+      height: 100%;
+      will-change: transform;
+      transform: translateZ(0);
+      backface-visibility: hidden;
+      padding-left: var(--pl);
+    }
+
+    /* Spot row — directly below the wheel card (#viewport), not over the strip */
+    .spot-overlay {
+      flex: 0 0 auto;
+      display: flex;
+      justify-content: center;
+      align-items: center;
+      width: 100%;
+      padding: clamp(3px, 0.9vmin, 7px) clamp(8px, 2vmin, 14px) clamp(5px, 1.2vmin, 10px);
+      pointer-events: none;
+      border-top: 1px solid rgba(30, 41, 59, 0.75);
+      background: rgba(8, 12, 20, 0.55);
+    }
+
+    .spot-chip {
+      display: inline-flex;
+      align-items: center;
+      gap: 10px;
+      padding: 7px 16px 8px;
+      border-radius: 999px;
+      background: linear-gradient(180deg, rgba(30, 41, 59, 0.92) 0%, rgba(15, 23, 42, 0.96) 100%);
+      border: 1px solid rgba(251, 191, 36, 0.42);
+      box-shadow:
+        0 0 0 1px rgba(0, 0, 0, 0.35),
+        0 6px 20px rgba(0, 0, 0, 0.45),
+        0 0 24px rgba(251, 191, 36, 0.12);
+      max-width: min(100%, 560px);
+    }
+
+    .spot-col {
+      display: flex;
+      flex-direction: column;
+      align-items: center;
+      gap: 2px;
+      min-width: 0;
+      flex: 1 1 auto;
+    }
+
+    .spot-assignment {
+      font-size: clamp(1.01rem, 2.59vmin, 1.23rem);
+      font-weight: 500;
+      letter-spacing: 0.02em;
+      color: rgba(203, 213, 225, 0.95);
+      line-height: 1.35;
+      max-width: 100%;
+      overflow: hidden;
+      text-overflow: ellipsis;
+      white-space: normal;
+      text-align: center;
+      display: -webkit-box;
+      -webkit-line-clamp: 3;
+      -webkit-box-orient: vertical;
+    }
+
+    .spot-icon {
+      flex-shrink: 0;
+      width: clamp(31px, 4.5vmin, 39px);
+      height: clamp(31px, 4.5vmin, 39px);
+      display: block;
+      filter: drop-shadow(0 1px 2px rgba(0, 0, 0, 0.5));
+    }
+
+    #spot {
+      font-size: clamp(1.23rem, 2.94vmin, 1.51rem);
+      font-weight: 700;
+      letter-spacing: 0.04em;
+      text-transform: none;
+      color: #fde68a;
+      white-space: normal;
+      text-align: center;
+      max-width: 100%;
+      text-shadow: 0 1px 2px rgba(0, 0, 0, 0.55);
+      line-height: 1.25;
+    }
+
+    .cell {
+      flex: 0 0 var(--cell-w);
+      width: var(--cell-w);
+      height: 100%;
+      padding: var(--gap);
+      display: flex;
+      align-items: stretch;
+      justify-content: center;
+    }
+
+    .cell-inner {
+      width: 100%;
+      height: 100%;
+      border-radius: clamp(8px, 1vmin, 12px);
+      position: relative;
+      border: 1px solid rgba(51, 65, 85, 0.95);
+      background:
+        linear-gradient(180deg, rgba(255, 255, 255, 0.05) 0%, transparent 40%),
+        var(--slot-bg);
+      display: flex;
+      align-items: center;
+      justify-content: center;
+      overflow: hidden;
+      box-shadow:
+        0 1px 0 rgba(255, 255, 255, 0.04) inset,
+        0 8px 20px rgba(0, 0, 0, 0.4);
+    }
+
+    .cell.win .cell-inner {
+      background:
+        linear-gradient(180deg, rgba(255, 255, 255, 0.1) 0%, transparent 42%),
+        linear-gradient(135deg, var(--win-bg) 0%, #4338ca 100%);
+      border-color: rgba(165, 180, 252, 0.7);
+      box-shadow:
+        0 0 0 1px rgba(165, 180, 252, 0.35) inset,
+        0 0 22px rgba(79, 70, 229, 0.5),
+        0 10px 24px rgba(0, 0, 0, 0.4);
+    }
+
+    @media (prefers-reduced-motion: no-preference) {
+      .cell.win.pulse .cell-inner {
+        animation: winGlow 0.95s ease-in-out infinite;
+      }
+    }
+
+    @keyframes winGlow {
+      0%, 100% {
+        box-shadow:
+          0 0 0 1px rgba(165, 180, 252, 0.35) inset,
+          0 0 18px rgba(79, 70, 229, 0.45),
+          0 10px 24px rgba(0, 0, 0, 0.4);
+      }
+      50% {
+        box-shadow:
+          0 0 0 2px rgba(251, 191, 36, 0.4) inset,
+          0 0 32px rgba(129, 140, 248, 0.6),
+          0 10px 24px rgba(0, 0, 0, 0.4);
+      }
+    }
+
+    .cell img {
+      max-width: 90%;
+      max-height: 92%;
+      object-fit: contain;
+      border-radius: 6px;
+      position: relative;
+      z-index: 1;
+    }
+
+    .sku {
+      position: relative;
+      z-index: 1;
+      font-size: clamp(0.82rem, 2.35vmin, 1.12rem);
+      font-weight: 600;
+      text-align: center;
+      padding: 6px 8px;
+      word-break: break-word;
+      line-height: 1.3;
+      max-height: 100%;
+      overflow: hidden;
+      color: rgba(226, 232, 240, 0.94);
+    }
+
+    .cell.win .sku {
+      color: var(--win-fg);
+      font-weight: 700;
+    }
+
+    #banner {
+      display: none;
+      position: absolute;
+      inset: 0;
+      z-index: 12;
+      flex-direction: column;
+      align-items: center;
+      justify-content: center;
+      padding: clamp(16px, 2.5vmin, 28px);
+      background: rgba(8, 12, 20, 0.94);
+    }
+
+    .banner-card {
+      max-width: min(520px, 94%);
+      padding: clamp(20px, 2.5vmin, 28px);
+      border-radius: 16px;
+      background: linear-gradient(165deg, #121c30 0%, #0c1220 100%);
+      border: 1px solid rgba(148, 163, 184, 0.28);
+      box-shadow: 0 20px 48px rgba(0, 0, 0, 0.5);
+    }
+
+    .banner-icon {
+      width: 48px;
+      height: 48px;
+      margin: 0 auto 10px;
+      border-radius: 12px;
+      display: flex;
+      align-items: center;
+      justify-content: center;
+      background: rgba(79, 70, 229, 0.22);
+      border: 1px solid rgba(165, 180, 252, 0.4);
+      color: var(--win-ring);
+    }
+
+    #banner.err .banner-icon {
+      background: rgba(255, 107, 107, 0.12);
+      border-color: rgba(255, 107, 107, 0.45);
+      color: var(--accent);
+    }
+
+    #banner h2 {
+      margin: 0 0 10px;
+      font-size: clamp(1rem, 2.4vmin, 1.25rem);
+      font-weight: 700;
+      line-height: 1.35;
+      color: var(--win-ring);
+    }
+
+    #banner.err h2 {
+      color: var(--accent);
+    }
+
+    #banner p {
+      margin: 0;
+      font-size: clamp(0.85rem, 2vmin, 1rem);
+      font-weight: 500;
+      line-height: 1.55;
+      color: rgba(226, 232, 240, 0.9);
+    }
+
+    body.show-banner .wheel-heading-stack,
+    body.show-banner #strip-wrap,
+    body.show-banner .spot-overlay,
+    body.show-banner .pointer-wrap,
+    body.show-banner .rail,
+    body.show-banner .rail-glow {
+      visibility: hidden;
+    }
+
+    body.show-banner #banner {
+      display: flex;
+    }
+  </style>
+</head>
+<body>
+  <div id="app">
+    <div class="obs-island">
+      <div class="obs-stage-wrap">
+        <div class="wheel-heading-stack">
+          <div class="wheel-heading-spacer" aria-hidden="true"></div>
+          <h1 class="wheel-heading">Prize Wheel</h1>
+          <div id="prizes-left-badge" aria-hidden="true"></div>
+        </div>
+        <div id="viewport">
+          <div class="pointer-wrap" aria-hidden="true">
+            <svg viewBox="0 0 36 30" fill="none" xmlns="http://www.w3.org/2000/svg" aria-hidden="true">
+              <defs>
+                <linearGradient id="ebPtrFill" x1="18" y1="4" x2="18" y2="26" gradientUnits="userSpaceOnUse">
+                  <stop stop-color="#fcd34d" />
+                  <stop offset="1" stop-color="#f59e0b" />
+                </linearGradient>
+                <filter id="ebPtrSh" x="-25%" y="-25%" width="150%" height="150%">
+                  <feDropShadow dx="0" dy="1" stdDeviation="1.2" flood-color="#0f172a" flood-opacity="0.7" />
+                </filter>
+              </defs>
+              <path
+                filter="url(#ebPtrSh)"
+                d="M18 26 L4 8 Q3 6 5 6 L31 6 Q33 6 32 8 Z"
+                fill="url(#ebPtrFill)"
+                stroke="#78350f"
+                stroke-width="1"
+                stroke-linejoin="round"
+              />
+            </svg>
+          </div>
+          <div class="rail-glow" aria-hidden="true"></div>
+          <div class="rail" aria-hidden="true"></div>
+          <div id="strip-wrap">
+            <div id="strip"></div>
+          </div>
+          <div id="banner">
+            <div class="banner-card">
+              <div class="banner-icon" id="banner-icon-wrap">
+                <svg id="banner-icon-info" width="22" height="22" viewBox="0 0 24 24" fill="none" aria-hidden="true">
+                  <path d="M12 16v-5M12 8h.01" stroke="currentColor" stroke-width="2" stroke-linecap="round" />
+                  <circle cx="12" cy="12" r="9" stroke="currentColor" stroke-width="1.75" />
+                </svg>
+                <svg id="banner-icon-warn" width="22" height="22" viewBox="0 0 24 24" fill="none" style="display:none" aria-hidden="true">
+                  <path d="M12 9v5M12 17h.01" stroke="currentColor" stroke-width="2" stroke-linecap="round" />
+                  <path d="M4.5 18L10.3 4.7c.5-1.1 2-1.1 2.5 0l5.8 13.3c.5 1.2-.3 2.2-1.5 2.2H6c-1.2 0-2-1-1.5-2.2z" stroke="currentColor" stroke-width="1.5" stroke-linejoin="round" />
+                </svg>
+              </div>
+              <h2 id="banner-title"></h2>
+              <p id="banner-sub"></p>
+            </div>
+          </div>
+        </div>
+        <div class="spot-overlay" aria-live="polite">
+          <div class="spot-chip">
+            <svg class="spot-icon" viewBox="0 0 32 32" fill="none" xmlns="http://www.w3.org/2000/svg" aria-hidden="true">
+              <circle cx="16" cy="16" r="14" stroke="rgba(251,191,36,0.35)" stroke-width="1.5" />
+              <circle cx="16" cy="16" r="9.5" stroke="url(#ebSpotRing)" stroke-width="2" />
+              <circle cx="16" cy="16" r="3.2" fill="url(#ebSpotCore)" />
+              <path d="M16 4v3M16 25v3M4 16h3M25 16h3" stroke="#fcd34d" stroke-width="1.25" stroke-linecap="round" opacity="0.85" />
+              <defs>
+                <linearGradient id="ebSpotRing" x1="8" y1="8" x2="24" y2="24" gradientUnits="userSpaceOnUse">
+                  <stop stop-color="#fbbf24" />
+                  <stop offset="1" stop-color="#f59e0b" />
+                </linearGradient>
+                <radialGradient id="ebSpotCore" cx="0" cy="0" r="1" gradientUnits="userSpaceOnUse" gradientTransform="translate(14 12) rotate(55) scale(8)">
+                  <stop stop-color="#fff7ed" />
+                  <stop offset="0.45" stop-color="#fbbf24" />
+                  <stop offset="1" stop-color="#d97706" />
+                </radialGradient>
+              </defs>
+            </svg>
+            <div class="spot-col">
+              <span id="spot">Spot 1</span>
+              <span id="spot-assignment" class="spot-assignment"></span>
+            </div>
+          </div>
+        </div>
+      </div>
+    </div>
+  </div>
+
+  <script>
+    (function () {
+      const strip = document.getElementById("strip");
+      const stripWrap = document.getElementById("strip-wrap");
+      const spot = document.getElementById("spot");
+      const spotAssignment = document.getElementById("spot-assignment");
+      const banner = document.getElementById("banner");
+      const bannerTitle = document.getElementById("banner-title");
+      const bannerSub = document.getElementById("banner-sub");
+      const iconInfo = document.getElementById("banner-icon-info");
+      const iconWarn = document.getElementById("banner-icon-warn");
+      const prizesLeftBadge = document.getElementById("prizes-left-badge");
+      const root = document.documentElement;
+      const body = document.body;
+
+      let lastCellsSig = "";
+      let lastCellCount = 0;
+      let lastColorsJson = "";
+
+      function applyTheme(d) {
+        const c = d.colors || {};
+        const j = JSON.stringify(c);
+        if (j === lastColorsJson) return;
+        lastColorsJson = j;
+        if (c.slotBg) root.style.setProperty("--slot-bg", c.slotBg);
+        if (c.slotBd) root.style.setProperty("--slot-bd", c.slotBd);
+        if (c.fg) root.style.setProperty("--fg", c.fg);
+        if (c.winBg) root.style.setProperty("--win-bg", c.winBg);
+        if (c.winFg) root.style.setProperty("--win-fg", c.winFg);
+        if (c.winRing) root.style.setProperty("--win-ring", c.winRing);
+        if (c.pointer) root.style.setProperty("--pointer", c.pointer);
+        if (c.pointerEdge) root.style.setProperty("--pointer-edge", c.pointerEdge);
+        if (c.track) root.style.setProperty("--track", c.track);
+        if (c.title) root.style.setProperty("--title", c.title);
+        if (c.accent) root.style.setProperty("--accent", c.accent);
+      }
+
+      function stripScrollPx(d, scroll) {
+        const sv = Number(scroll) || 0;
+        const aw =
+          stripWrap && stripWrap.clientWidth > 0 ? stripWrap.clientWidth : 0;
+        const vw = Number(d.viewportW);
+        if (aw > 0 && Number.isFinite(vw) && vw > 0) {
+          return sv + (vw - aw) * 0.5;
+        }
+        return sv;
+      }
+
+      function cellsSignature(d) {
+        const cells = d.cells || [];
+        var s = "";
+        for (var i = 0; i < cells.length; i++) {
+          var c = cells[i];
+          s += (c.sku || "") + "\t" + (c.img || "") + "|";
+        }
+        return s + ":" + (d.cellW || 0) + ":" + (d.padTop || 0) + ":" + (d.padBottom || 0) + ":" + (d.gap != null ? d.gap : "") + ":" + (d.pl != null ? d.pl : "");
+      }
+
+      function renderStripCells(d) {
+        const cw = d.cellW || 127;
+        root.style.setProperty("--cell-w", cw + "px");
+        root.style.setProperty("--pad-top", (d.padTop || 28) + "px");
+        root.style.setProperty("--pad-bottom", (d.padBottom || 14) + "px");
+        root.style.setProperty("--gap", (d.gap != null ? d.gap : 2.5) + "px");
+        root.style.setProperty("--pl", (d.pl != null ? d.pl : 0) + "px");
+        const cells = d.cells || [];
+        strip.replaceChildren();
+        for (let i = 0; i < cells.length; i++) {
+          const c = cells[i];
+          const wrap = document.createElement("div");
+          wrap.className = "cell" + (c.win ? " win" : "") + (d.pulse && c.win ? " pulse" : "");
+          const inner = document.createElement("div");
+          inner.className = "cell-inner";
+          if (c.img) {
+            const im = document.createElement("img");
+            im.alt = "";
+            im.src = c.img;
+            im.referrerPolicy = "no-referrer";
+            im.loading = "lazy";
+            im.onerror = function () {
+              im.replaceWith(mkSku(c.sku));
+            };
+            inner.appendChild(im);
+          } else {
+            inner.appendChild(mkSku(c.sku));
+          }
+          wrap.appendChild(inner);
+          strip.appendChild(wrap);
+        }
+        lastCellCount = cells.length;
+      }
+
+      function applyStripTransform(d, scroll) {
+        const adj = stripScrollPx(d, scroll);
+        const x = (-adj).toFixed(2);
+        strip.style.transform = "translate3d(" + x + "px,0,0)";
+      }
+
+      function updateStripMotionOnly(d) {
+        const scroll = Number(d.scroll) || 0;
+        applyStripTransform(d, scroll);
+        const cells = d.cells || [];
+        if (cells.length !== lastCellCount) return false;
+        const kids = strip.children;
+        for (let i = 0; i < cells.length && i < kids.length; i++) {
+          const c = cells[i];
+          const wrap = kids[i];
+          const win = !!c.win;
+          const pulse = !!(d.pulse && c.win);
+          const next = "cell" + (win ? " win" : "") + (pulse ? " pulse" : "");
+          if (wrap.className !== next) wrap.className = next;
+        }
+        return true;
+      }
+
+      function renderStrip(d) {
+        body.classList.remove("show-banner");
+        banner.classList.remove("err");
+        const sig = cellsSignature(d);
+        const scroll = Number(d.scroll) || 0;
+        if (sig === lastCellsSig && lastCellCount > 0) {
+          updateStripMotionOnly(d);
+          return;
+        }
+        lastCellsSig = sig;
+        renderStripCells(d);
+        applyStripTransform(d, scroll);
+      }
+
+      function mkSku(text) {
+        const el = document.createElement("div");
+        el.className = "sku";
+        el.textContent = text || "—";
+        return el;
+      }
+
+      function renderBanner(d) {
+        body.classList.add("show-banner");
+        lastCellsSig = "";
+        lastCellCount = 0;
+        lastColorsJson = "";
+        if (d.bannerAccent === "error") {
+          banner.classList.add("err");
+          if (iconInfo) iconInfo.style.display = "none";
+          if (iconWarn) iconWarn.style.display = "block";
+        } else {
+          banner.classList.remove("err");
+          if (iconInfo) iconInfo.style.display = "block";
+          if (iconWarn) iconWarn.style.display = "none";
+        }
+        bannerTitle.textContent = d.bannerTitle || "";
+        bannerSub.textContent = d.bannerSubtitle || "";
+      }
+
+      var pollInFlight = false;
+      function poll() {
+        if (pollInFlight || document.visibilityState === "hidden") return;
+        pollInFlight = true;
+        fetch("/api/wheel.json", { cache: "no-store" })
+          .then(function (r) {
+            return r.json();
+          })
+          .then(function (d) {
+            applyTheme(d);
+            if (prizesLeftBadge) {
+              prizesLeftBadge.textContent =
+                d.prizesLeftLabel != null ? String(d.prizesLeftLabel) : "";
+            }
+            const head =
+              d.obsHeadline != null && String(d.obsHeadline).trim() !== ""
+                ? String(d.obsHeadline).trim()
+                : d.spotLabel || "—";
+            spot.textContent = head;
+            if (spotAssignment) {
+              const sub =
+                d.obsSubhead != null && String(d.obsSubhead).trim() !== ""
+                  ? String(d.obsSubhead).trim()
+                  : d.spotAssignment != null
+                    ? String(d.spotAssignment).trim()
+                    : "";
+              spotAssignment.textContent = sub;
+            }
+            if (d.mode === "banner") {
+              renderBanner(d);
+            } else {
+              renderStrip(d);
+            }
+          })
+          .catch(function () {
+            body.classList.add("show-banner");
+            banner.classList.add("err");
+            lastCellsSig = "";
+            lastCellCount = 0;
+            lastColorsJson = "";
+            if (iconInfo) iconInfo.style.display = "none";
+            if (iconWarn) iconWarn.style.display = "block";
+            if (spotAssignment) spotAssignment.textContent = "";
+            if (spot) spot.textContent = "—";
+            bannerTitle.textContent = "Wheel feed offline";
+            bannerSub.textContent = "Start the Energy Break app — this page loads live data from localhost.";
+          })
+          .finally(function () {
+            pollInFlight = false;
+          });
+      }
+
+      setInterval(poll, 24);
+      poll();
+    })();
+  </script>
+</body>
+</html>
