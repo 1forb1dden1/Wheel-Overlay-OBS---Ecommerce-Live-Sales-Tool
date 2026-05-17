@@ -23,6 +23,45 @@ def default_list_path() -> Path:
     return Path(__file__).resolve().parent / "Input List.xlsx"
 
 
+def normalize_wheel_id(name: str) -> str:
+    """Turn user input into a wheel id (e.g. wheel51345, or wheel51345.xlsx -> wheel51345)."""
+    s = (name or "").strip()
+    if not s:
+        return ""
+    if "/" in s or "\\" in s:
+        s = Path(s).name
+    low = s.lower()
+    if low.endswith(".xlsx"):
+        s = s[: -len(".xlsx")]
+    return s.strip().strip(".")
+
+
+def wheel_preset_paths(wheel_id: str, base: Path | None = None) -> tuple[Path, Path]:
+    """
+    Paths for a named wheel next to the app folder (or ``base`` when given).
+
+    Example: wheel51345 -> ``base/wheel51345.xlsx`` and ``base/wheel51345/`` for images.
+    """
+    wid = normalize_wheel_id(wheel_id)
+    if not wid:
+        raise PrizeDrawError("Wheel name is empty.")
+    root = (base if base is not None else Path(__file__).resolve().parent).resolve()
+    return root / f"{wid}.xlsx", root / wid
+
+
+def wheel_preset_paths_from_list_file(list_path: Path) -> tuple[str, Path, Path]:
+    """
+    Derive preset id and paths from a prize list file.
+
+    ``wheel51345.xlsx`` -> id ``wheel51345``, images folder ``<same dir>/wheel51345/``.
+    """
+    path = list_path.expanduser().resolve()
+    wid = normalize_wheel_id(path.name)
+    if not wid:
+        raise PrizeDrawError("Could not use that file name as a wheel preset.")
+    return wid, path, path.parent / wid
+
+
 class PrizeDrawError(RuntimeError):
     """Recoverable errors for library / UI callers (CLI maps these to stderr + exit)."""
 
@@ -151,18 +190,20 @@ def build_wheel_spin_strip(
     winner: str,
     win_idx: int,
 ) -> list[str]:
-    """Build a strip of ``length`` cells; ``win_idx`` shows ``winner``, others are qty-weighted."""
-    fillers = sample_wheel_strip_labels(rows, max(0, length - 1))
-    strip: list[str] = []
-    fi = 0
-    for i in range(length):
-        if i == win_idx:
-            strip.append(winner)
-        elif fi < len(fillers):
-            strip.append(fillers[fi])
-            fi += 1
-        else:
-            strip.append(winner)
+    """Build a strip of ``length`` cells; ``winner`` at ``win_idx``, every slot a non-empty SKU."""
+    if length <= 0:
+        return []
+    win_i = max(0, min(length - 1, int(win_idx)))
+    w = (winner or "").strip()
+    strip = sample_wheel_strip_labels(rows, length)
+    while len(strip) < length:
+        extra = sample_wheel_strip_labels(rows, length - len(strip))
+        if not extra:
+            strip.extend([w or "···"] * (length - len(strip)))
+            break
+        strip.extend(extra)
+    strip = [(s or "").strip() or w or "···" for s in strip[:length]]
+    strip[win_i] = w or strip[win_i]
     return strip
 
 

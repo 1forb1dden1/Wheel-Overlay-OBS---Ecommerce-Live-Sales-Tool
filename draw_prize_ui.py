@@ -16,6 +16,7 @@ from dataclasses import dataclass
 from datetime import datetime
 from io import BytesIO
 from typing import Literal
+from zoneinfo import ZoneInfo
 import urllib.request
 import tkinter as tk
 import tkinter.font as tkfont
@@ -25,6 +26,7 @@ from tkinter import filedialog, messagebox, scrolledtext, ttk
 from urllib.parse import quote, urlparse, unquote
 from urllib.request import url2pathname
 
+import app_local_state
 import draw_prize
 
 try:
@@ -63,7 +65,7 @@ WHEEL_VERTICAL_SCALE = 1.2
 
 WHEEL_STRIP_PAD_TOP = int(round(28 * WHEEL_VERTICAL_SCALE))
 WHEEL_STRIP_PAD_BOTTOM = int(round(14 * WHEEL_VERTICAL_SCALE))
-WHEEL_STRIP_CELL_GAP = 2.5
+WHEEL_STRIP_CELL_GAP = 6.0
 # HTML / OBS Browser Source: strip only — base scale vs. Tk, then width/pad tweaks for overlay layout.
 HTML_WHEEL_DISPLAY_SCALE = 1.25
 HTML_WHEEL_STRIP_WIDTH_MUL = 0.8  # strip cells 20% narrower than (Tk × DISPLAY_SCALE)
@@ -106,7 +108,14 @@ SPIN_CONTROLS_CARD_BORDER = WHEEL_CELL_BORDER
 SPIN_CONTROLS_WIN_WIDTH = 720
 SPIN_CONTROLS_WIN_HEIGHT = 920
 SPIN_CONTROLS_WIN_MIN_WIDTH = 560
-SPIN_CONTROLS_WIN_MIN_HEIGHT = 520
+SPIN_CONTROLS_WIN_MIN_HEIGHT = 580
+# Live wheel on Spin & controls only (smaller than the hidden OBS/snapshot canvas).
+SPIN_CONTROLS_WHEEL_CANVAS_H = int(round(128 * WHEEL_VERTICAL_SCALE))
+SPIN_CONTROLS_WHEEL_CANVAS_H_MAX = int(round(168 * WHEEL_VERTICAL_SCALE))
+# Overlay window: compact height vs setup panel scroll viewport (Step 1, 2, options, log).
+OVERLAY_WIDTH = 480
+OVERLAY_HEIGHT_COMPACT = int(round(280 * WHEEL_VERTICAL_SCALE))
+OVERLAY_SETUP_SCROLL_MAX = 360
 
 
 def script_dir() -> Path:
@@ -320,7 +329,7 @@ class SpinControlsWindow(tk.Toplevel):
         ).pack(fill=tk.X, padx=18, pady=(14, 4))
         tk.Label(
             header,
-            text="Draw, edit spin, fill skipped spots, HTML wheel for OBS, new wheel, prize board (scroll below).",
+            text="Live wheel preview at the top; draw, edit spin, OBS HTML, new wheel, and prize board below (scroll).",
             font=("Segoe UI", 9),
             bg=PRIZE_BOARD_HEADER_BG,
             fg=WHEEL_MUTED,
@@ -414,8 +423,8 @@ class SpinControlsWindow(tk.Toplevel):
                 pass
 
         app.after_idle(_initial_scroll_sync)
-
-        self.bind("<Button-1>", app._on_ui_click_defocus_wheel_name_entry, add="+")
+        app.after_idle(app._on_spin_controls_wheel_panel_ready)
+        app.after_idle(app._refresh_fill_skipped_hint)
 
         app._spin_controls_wheel_link_reset()
         self.bind("<Configure>", self._on_spin_controls_configure)
@@ -446,16 +455,21 @@ class SpinControlsWindow(tk.Toplevel):
 class DrawPrizeApp(tk.Tk):
     WHEEL_CELL = int(round(118 * 1.5 * 0.8 * 0.9 * WHEEL_VERTICAL_SCALE))
     WHEEL_STRIP_LEN = 44
+    # Spin strip: multiple packed laps (more prizes on screen + longer travel).
+    WHEEL_SPIN_LAP_LEN = 32
+    WHEEL_SPIN_LAPS = 4
+    WHEEL_SPIN_CELL_GAP = 5.0
     # Home / idle horizontal strip: logical preview length; physical strip is doubled for seamless carousel.
     WHEEL_IDLE_STRIP_LEN = 11
     WHEEL_IDLE_CAROUSEL_COPIES = 2
     # Short strip while the worker loads picks (before the full spin strip is built).
-    WHEEL_LOADING_STRIP_LEN = 7
+    WHEEL_LOADING_STRIP_LEN = 15
     # Total horizontal clear pixels between adjacent wheel item rectangles (scaled with cell).
     WHEEL_CELL_INTER_GAP = int(round(18 * 1.5 * 0.8 * 0.9 * 1.1))
-    # Strip spin: duration + ease control how the wheel slows into the winner (quintic felt sticky at the end).
-    WHEEL_SPIN_DURATION_SEC = 2.15 * 1.2
-    WHEEL_SPIN_EASE_OUT_POWER = 3
+    # Strip spin: duration + ease-out so the wheel rolls fast then progressively slows into the winner.
+    WHEEL_SPIN_DURATION_FAST_SEC = 2.0
+    WHEEL_SPIN_DURATION_SLOW_SEC = 4.5
+    WHEEL_SPIN_EASE_OUT_POWER = 5.0
     WHEEL_SPIN_TICK_MS = 16
     # Idle home strip: slow scroll left (loops when it reaches end of usable range).
     WHEEL_IDLE_DRIFT_MS = 45
@@ -465,31 +479,110 @@ class DrawPrizeApp(tk.Tk):
     WHEEL_CANVAS_H_LINK_MAX = int(round(540 * WHEEL_VERTICAL_SCALE))
     # Main overlay: winner session listbox shows at most this many rows; scroll for the rest.
     OVERLAY_WINNER_LIST_VISIBLE_ROWS = 25
+    TEXAS_TZ = ZoneInfo("America/Chicago")
 
     @classmethod
-    def _wheel_cell_xmargins(cls) -> tuple[int, int]:
-        g = cls.WHEEL_CELL_INTER_GAP
+    def _wheel_cell_xmargins(cls, *, dense: bool = False) -> tuple[int, int]:
+        g = max(10, cls.WHEEL_CELL_INTER_GAP // 2) if dense else cls.WHEEL_CELL_INTER_GAP
         return g // 2, g - g // 2
 
     @classmethod
-    def _wheel_slot_center_offset(cls) -> float:
+    def _wheel_slot_center_offset(cls, *, dense: bool = False) -> float:
         """X offset from i*cw - scroll to the visual center of slot i (matches Tk (x0+x1)/2)."""
         cw = float(cls.WHEEL_CELL)
-        pl, pr = cls._wheel_cell_xmargins()
+        pl, pr = cls._wheel_cell_xmargins(dense=dense)
         return (float(pl) + cw - float(pr)) / 2.0
 
     @classmethod
-    def _wheel_scroll_to_center_index(cls, index: float, viewport_w: float) -> float:
+    def _wheel_scroll_to_center_index(
+        cls, index: float, viewport_w: float, *, dense: bool = False
+    ) -> float:
         """Scroll value so slot ``index`` is centered under x = viewport_w/2."""
         cw = float(cls.WHEEL_CELL)
-        return index * cw + cls._wheel_slot_center_offset() - viewport_w / 2.0
+        return index * cw + cls._wheel_slot_center_offset(dense=dense) - viewport_w / 2.0
+
+    @classmethod
+    def _wheel_spin_ease(cls, t: float) -> float:
+        """
+        Ease-out progress for spin animation (0 = start, 1 = landed).
+
+        High power = most distance early, then a long progressive slowdown at the end.
+        """
+        t = max(0.0, min(1.0, float(t)))
+        if t >= 1.0:
+            return 1.0
+        omt = 1.0 - t
+        return 1.0 - omt ** float(cls.WHEEL_SPIN_EASE_OUT_POWER)
+
+    def _wheel_primary_viewport_w(self) -> float:
+        """Width used when storing scroll (OBS / hidden strip canvas), not Spin & controls preview."""
+        try:
+            return max(2.0, float(int(self.wheel_canvas.winfo_width())))
+        except tk.TclError:
+            return 1000.0
+
+    def _wheel_reference_viewport_w(self) -> float:
+        w = getattr(self, "_wheel_ref_viewport_w", None)
+        if w is None or float(w) < 2.0:
+            return self._wheel_primary_viewport_w()
+        return float(w)
+
+    def _wheel_note_scroll_viewport(self, viewport_w: float | None = None) -> None:
+        if viewport_w is None:
+            viewport_w = self._wheel_primary_viewport_w()
+        self._wheel_ref_viewport_w = max(2.0, float(viewport_w))
+
+    def _wheel_scroll_convert_viewport(self, scroll: float, from_w: float, to_w: float) -> float:
+        """Same slot under the pointer after resize: convert scroll between viewport widths."""
+        if abs(from_w - to_w) < 0.5:
+            return float(scroll)
+        mid = float(self._wheel_slot_center_offset())
+        cw = float(self.WHEEL_CELL)
+        index = (float(scroll) + from_w / 2.0 - mid) / cw
+        return index * cw + mid - to_w / 2.0
+
+    def _wheel_scroll_for_canvas(self, c: tk.Canvas, scroll_at_ref: float) -> float:
+        ref = self._wheel_reference_viewport_w()
+        try:
+            w = max(2.0, float(int(c.winfo_width())))
+        except tk.TclError:
+            return float(scroll_at_ref)
+        return self._wheel_scroll_convert_viewport(float(scroll_at_ref), ref, w)
+
+    def _wheel_spin_duration_sec(self) -> float:
+        mode = "fast"
+        var = getattr(self, "wheel_spin_speed_var", None)
+        if var is not None:
+            try:
+                mode = str(var.get() or "fast").strip().lower()
+            except tk.TclError:
+                pass
+        if mode == "slow":
+            return float(type(self).WHEEL_SPIN_DURATION_SLOW_SEC)
+        return float(type(self).WHEEL_SPIN_DURATION_FAST_SEC)
+
+    def _wheel_scroll_for_strip_render_on_canvas(self, c: tk.Canvas) -> float:
+        s = self._wheel_scroll_for_canvas(c, float(self._wheel_scroll))
+        if self._wheel_idle_drift_active():
+            ref = self._wheel_reference_viewport_w()
+            try:
+                w = max(2.0, float(int(c.winfo_width())))
+            except tk.TclError:
+                w = ref
+            off = float(getattr(self, "_wheel_idle_offset", 0.0) or 0.0)
+            if ref > 0:
+                s += off * (w / ref)
+            else:
+                s += off
+        return s
 
     def __init__(self) -> None:
         super().__init__()
         self._void_bg_widgets: list[tk.Misc] = []
         self.title("Energy Break — Overlay")
-        self.geometry(f"480x{int(round(280 * WHEEL_VERTICAL_SCALE))}")
+        self.geometry(f"{OVERLAY_WIDTH}x{OVERLAY_HEIGHT_COMPACT}")
         self.minsize(380, 200)
+        self._overlay_compact_height = OVERLAY_HEIGHT_COMPACT
         self._prize_win: PrizeListOverlay | None = None
         self._controls_win: SpinControlsWindow | None = None
         self._spin_controls_wheel_sync_after: str | int | None = None
@@ -515,6 +608,7 @@ class DrawPrizeApp(tk.Tk):
         self._backfill_target_spot: int | None = None
         self._winner_log_path: Path | None = None
         self._winner_next_spin = 1
+        self._active_wheel_preset_id = ""
         self._undo_spin_snap: _UndoSpinSnapshot | None = None
         self._winner_overlay_poll_after: str | int | None = None
         self._winner_overlay_poll_started = False
@@ -529,9 +623,11 @@ class DrawPrizeApp(tk.Tk):
         self._wheel_win_idx = 0
         self._wheel_target_scroll = 0.0
         self._wheel_scroll = 0.0
+        self._wheel_ref_viewport_w = 1000.0
         self._wheel_idle_offset = 0.0
         self._wheel_idle_drift_after: str | int | None = None
         self._wheel_pulse_highlight = False
+        self._wheel_dense_pack_active = False
         self._customer_empty_wheel = False
         self._wheel_sku_to_img: dict[str, str] = {}
         self._wheel_image_cache: dict[str, object] = {}
@@ -544,9 +640,10 @@ class DrawPrizeApp(tk.Tk):
         self._inventory_image_cache: dict[tuple[str, int], object] = {}
         self._prize_board_grid_cols = tk.IntVar(value=PRIZE_BOARD_GRID_COLS_DEFAULT)
         self._prize_board_tile_rows_fit = tk.IntVar(value=PRIZE_BOARD_ROWS_FIT_DEFAULT)
-        self._new_wheel_name_var = tk.StringVar(value="")
+        self.wheel_preset_var = tk.StringVar(value="")
         self._prize_board_resize_after: str | int | None = None
         self._prize_board_last_layout: tuple[int, int, int] | None = None
+        self._app_state_save_after: str | int | None = None
 
         self._prize_board_grid_cols.trace_add("write", self._on_prize_board_grid_var_write)
         self._prize_board_tile_rows_fit.trace_add("write", self._on_prize_board_grid_var_write)
@@ -561,7 +658,7 @@ class DrawPrizeApp(tk.Tk):
         self._register_void_bg(self._setup_toggle_frame)
         self._chk_setup_expand = tk.Checkbutton(
             self._setup_toggle_frame,
-            text="Show setup (list path, dry run, log)",
+            text="Show setup (choose files & options)",
             variable=self._setup_expanded,
             command=self._toggle_setup,
             bg=self._void_bg(),
@@ -576,16 +673,16 @@ class DrawPrizeApp(tk.Tk):
 
         self.setup_frame = tk.Frame(self, bg=self._void_bg())
         self._register_void_bg(self.setup_frame)
-        self._build_setup_form(self.setup_frame)
-        self._init_winner_session_log()
+        self._build_setup_scroll_shell()
+        self._build_setup_form(self._setup_scroll_body)
+        if not self._load_app_state():
+            self._init_winner_session_log()
 
         self._wheel_host = tk.Frame(self, bg=self._void_bg())
         self._register_void_bg(self._wheel_host)
         self._wheel_host.pack(fill=tk.X, expand=False, padx=8, pady=(4, 8))
         self._build_wheel_area(self._wheel_host)
         self._build_prize_list_window()
-
-        self.bind("<Button-1>", self._on_ui_click_defocus_wheel_name_entry, add="+")
 
         self._update_spin_counter_label()
         self._log(
@@ -743,17 +840,28 @@ class DrawPrizeApp(tk.Tk):
         def _img(sku: str) -> tuple[bytes, str] | None:
             return self._wheel_html_image_bytes(sku)
 
-        httpd, port = _wheel_http_boot(html_path, _snap, _img)
+        try:
+            from wheel_html_server import WHEEL_HTML_SERVER_PORT as _html_port_default
+        except ImportError:
+            _html_port_default = 8765
+        httpd, port, warn = _wheel_http_boot(html_path, _snap, _img)
         if httpd is None or not port:
             self._log("HTML wheel: web/wheel_spin.html not found — browser / OBS mirror disabled.\n")
             return
         self._wheel_http_server = httpd
         self._wheel_http_port = int(port)
+        url = f"http://127.0.0.1:{port}/"
+        if port == _html_port_default:
+            obs_hint = f"OBS Browser Source (fixed URL): {url}"
+        else:
+            obs_hint = f"HTML wheel (OBS): {url}"
         self._log(
-            f"HTML wheel (OBS): http://127.0.0.1:{port}/  — transparent page; strip width "
+            f"{obs_hint}  — transparent page; strip width "
             f"{int(round(100 * HTML_WHEEL_DISPLAY_SCALE * HTML_WHEEL_STRIP_WIDTH_MUL))}% of app cells, "
             f"strip vertical pad +{int(round(100 * (HTML_WHEEL_STRIP_PAD_V_MUL - 1)))}% (after display scale).\n"
         )
+        if warn:
+            self._log(f"HTML wheel warning: {warn}\n")
 
     def _wheel_html_image_bytes(self, sku: str) -> tuple[bytes, str] | None:
         if sku not in self._wheel_strip and sku not in self._wheel_sku_to_img:
@@ -916,14 +1024,15 @@ class DrawPrizeApp(tk.Tk):
         scroll_model = float(self._wheel_scroll)
         scroll_vis = self._wheel_scroll_for_strip_render()
         cw = float(self.WHEEL_CELL)
-        pl, pr = self._wheel_cell_xmargins()
-        gap = float(WHEEL_STRIP_CELL_GAP)
+        dense = bool(getattr(self, "_wheel_dense_pack_active", False))
+        pl, pr = self._wheel_cell_xmargins(dense=dense)
+        gap = float(type(self).WHEEL_SPIN_CELL_GAP if dense else WHEEL_STRIP_CELL_GAP)
         hs = float(HTML_WHEEL_DISPLAY_SCALE)
         hw = hs * float(HTML_WHEEL_STRIP_WIDTH_MUL)
         pv = hs * float(HTML_WHEEL_STRIP_PAD_V_MUL)
         hch = float(HTML_WHEEL_STRIP_CELL_HEIGHT_MUL)
         landed = abs(scroll_model - float(self._wheel_target_scroll)) < 1.5
-        slot_mid = self._wheel_slot_center_offset()
+        slot_mid = self._wheel_slot_center_offset(dense=dense)
         cells: list[dict] = []
         winning_sku = ""
         idle_carousel = len(self._wheel_strip) == int(type(self).WHEEL_IDLE_STRIP_LEN) * int(
@@ -999,8 +1108,9 @@ class DrawPrizeApp(tk.Tk):
         cx = w / 2.0
         scroll = float(self._wheel_scroll)
         cw = float(self.WHEEL_CELL)
-        pl, pr = self._wheel_cell_xmargins()
-        slot_mid = self._wheel_slot_center_offset()
+        dense_sf = bool(getattr(self, "_wheel_dense_pack_active", False))
+        pl, pr = self._wheel_cell_xmargins(dense=dense_sf)
+        slot_mid = self._wheel_slot_center_offset(dense=dense_sf)
         landed = abs(scroll - float(self._wheel_target_scroll)) < 1.5
         hs = float(HTML_WHEEL_DISPLAY_SCALE)
         hw = hs * float(HTML_WHEEL_STRIP_WIDTH_MUL)
@@ -1050,7 +1160,11 @@ class DrawPrizeApp(tk.Tk):
                     self._wheel_html_snapshot_cache = fast
                     return
             self._wheel_html_snapshot_cache = self._wheel_build_html_snapshot()
-        except Exception:
+        except Exception as e:
+            try:
+                self._log(f"Wheel snapshot error: {type(e).__name__}: {e}\n")
+            except Exception:
+                pass
             try:
                 pl_err = self._wheel_prizes_left_label_text()
             except Exception:
@@ -1071,34 +1185,6 @@ class DrawPrizeApp(tk.Tk):
                 "prizesLeftLabel": pl_err,
             }
 
-    def _on_ui_click_defocus_wheel_name_entry(self, event: tk.Event) -> None:
-        """If the wheel name field has focus, move focus away when the user clicks another widget."""
-        ent = getattr(self, "_new_wheel_name_entry", None)
-        if ent is None or event.widget == ent:
-            return
-        try:
-            if self.focus_get() != ent:
-                return
-        except tk.TclError:
-            return
-        try:
-            event.widget.focus_set()
-        except tk.TclError:
-            pass
-        try:
-            if self.focus_get() == ent:
-                cw = getattr(self, "_controls_win", None)
-                if cw is not None:
-                    try:
-                        if cw.winfo_exists():
-                            c = getattr(cw, "_spin_controls_scroll_canvas", None)
-                            if c is not None:
-                                c.focus_set()
-                    except tk.TclError:
-                        pass
-        except tk.TclError:
-            pass
-
     def _build_spin_controls_window(self) -> None:
         if self._controls_win is not None:
             try:
@@ -1115,6 +1201,7 @@ class DrawPrizeApp(tk.Tk):
             try:
                 if cw.winfo_exists():
                     cw.lift()
+                    self._on_spin_controls_wheel_panel_ready()
                     return
             except tk.TclError:
                 self._controls_win = None
@@ -1165,6 +1252,7 @@ class DrawPrizeApp(tk.Tk):
         self.remaining_inner = None  # type: ignore[assignment]
         self._remaining_canvas_win = None  # type: ignore[assignment]
         self._prize_board_totals_label = None
+        self._save_app_state()
         self._wheel_shutdown_html_server()
         super().destroy()
 
@@ -1205,30 +1293,391 @@ class DrawPrizeApp(tk.Tk):
     def _toggle_setup(self) -> None:
         if self._setup_expanded.get():
             self.setup_frame.pack(fill=tk.X, padx=8, pady=(0, 4), before=self._wheel_host)
+            self.after_idle(self._overlay_resize_for_setup)
         else:
             self.setup_frame.pack_forget()
+            self.after_idle(self._overlay_resize_compact)
 
     def _toggle_log(self) -> None:
         if self._log_visible.get():
             self.log_frame.pack(fill=tk.BOTH, expand=False, pady=(4, 0))
         else:
             self.log_frame.pack_forget()
+        self._setup_sync_scroll_region()
+        if self._setup_expanded.get():
+            self.after_idle(self._overlay_resize_for_setup)
+
+    def _build_setup_scroll_shell(self) -> None:
+        """Scrollable setup panel so Step 2, defaults, and log are not clipped on the overlay."""
+        vb = self._void_bg()
+        host = tk.Frame(self.setup_frame, bg=vb)
+        host.pack(fill=tk.BOTH, expand=True)
+        self._register_void_bg(host)
+
+        tk.Label(
+            host,
+            text="Scroll ↓ for Step 2, wheel preset, and options",
+            font=("Segoe UI", 8),
+            bg=vb,
+            fg=WHEEL_MUTED,
+            anchor=tk.W,
+        ).pack(fill=tk.X, padx=2, pady=(0, 4))
+
+        scroll_outer = tk.Frame(host, bg=vb)
+        scroll_outer.pack(fill=tk.BOTH, expand=True)
+        self._setup_scroll_outer = scroll_outer
+
+        self._setup_scroll_canvas = tk.Canvas(
+            scroll_outer,
+            bg=vb,
+            height=OVERLAY_SETUP_SCROLL_MAX,
+            highlightthickness=0,
+            bd=0,
+        )
+        self._setup_scrollbar = tk.Scrollbar(
+            scroll_outer,
+            orient=tk.VERTICAL,
+            command=self._setup_scroll_canvas.yview,
+            bg=vb,
+            troughcolor=WHEEL_CELL_BG,
+            activebackground=WHEEL_POINTER,
+        )
+        self._setup_scroll_canvas.configure(yscrollcommand=self._setup_scrollbar.set)
+        self._setup_scrollbar.pack(side=tk.RIGHT, fill=tk.Y)
+        self._setup_scroll_canvas.pack(side=tk.LEFT, fill=tk.BOTH, expand=True)
+
+        self._setup_scroll_body = tk.Frame(self._setup_scroll_canvas, bg=vb)
+        self._setup_scroll_body_win = self._setup_scroll_canvas.create_window(
+            (0, 0), window=self._setup_scroll_body, anchor=tk.NW
+        )
+
+        def _sync_setup_scroll_width(_event: object | None = None) -> None:
+            try:
+                cw = max(200, int(self._setup_scroll_canvas.winfo_width()) - 4)
+            except tk.TclError:
+                return
+            try:
+                self._setup_scroll_canvas.itemconfigure(self._setup_scroll_body_win, width=cw)
+            except tk.TclError:
+                pass
+            wrap = max(260, cw - 24)
+            for lab in getattr(self, "_setup_wrap_labels", ()):
+                try:
+                    lab.configure(wraplength=wrap)
+                except tk.TclError:
+                    pass
+
+        def _on_setup_body_configure(_event: tk.Event) -> None:
+            self._setup_sync_scroll_region()
+            _sync_setup_scroll_width()
+
+        def _on_setup_canvas_configure(_event: tk.Event) -> None:
+            _sync_setup_scroll_width()
+
+        self._setup_scroll_body.bind("<Configure>", _on_setup_body_configure, add="+")
+        self._setup_scroll_canvas.bind("<Configure>", _on_setup_canvas_configure, add="+")
+
+        def _wheel_setup(event: tk.Event) -> None:
+            if getattr(event, "delta", 0):
+                self._setup_scroll_canvas.yview_scroll(int(-1 * (event.delta / 120)), "units")
+
+        def _wheel_setup_up(_event: tk.Event) -> None:
+            self._setup_scroll_canvas.yview_scroll(-1, "units")
+
+        def _wheel_setup_down(_event: tk.Event) -> None:
+            self._setup_scroll_canvas.yview_scroll(1, "units")
+
+        def _bind_setup_wheel(_event: tk.Event) -> None:
+            self._setup_scroll_canvas.bind_all("<MouseWheel>", _wheel_setup)
+            self._setup_scroll_canvas.bind_all("<Button-4>", _wheel_setup_up)
+            self._setup_scroll_canvas.bind_all("<Button-5>", _wheel_setup_down)
+
+        def _unbind_setup_wheel(_event: tk.Event) -> None:
+            try:
+                self._setup_scroll_canvas.unbind_all("<MouseWheel>")
+                self._setup_scroll_canvas.unbind_all("<Button-4>")
+                self._setup_scroll_canvas.unbind_all("<Button-5>")
+            except tk.TclError:
+                pass
+
+        scroll_outer.bind("<Enter>", _bind_setup_wheel)
+        scroll_outer.bind("<Leave>", _unbind_setup_wheel)
+
+        self._setup_wrap_labels: list[tk.Label] = []
+        self.after_idle(_sync_setup_scroll_width)
+
+    def _setup_sync_scroll_region(self) -> None:
+        c = getattr(self, "_setup_scroll_canvas", None)
+        if c is None:
+            return
+        try:
+            self.update_idletasks()
+            c.configure(scrollregion=c.bbox("all"))
+        except tk.TclError:
+            pass
+
+    def _overlay_chrome_height(self, *, include_setup: bool) -> int:
+        self.update_idletasks()
+        parts = [self._drag_bar, self._setup_toggle_frame, self._wheel_host]
+        if include_setup and self._setup_expanded.get():
+            try:
+                if self.setup_frame.winfo_ismapped():
+                    parts.insert(2, self.setup_frame)
+            except tk.TclError:
+                pass
+        total = 12
+        for w in parts:
+            try:
+                if w.winfo_ismapped():
+                    total += int(w.winfo_reqheight())
+            except tk.TclError:
+                continue
+        return max(OVERLAY_HEIGHT_COMPACT, total)
+
+    def _overlay_resize_compact(self) -> None:
+        h = self._overlay_chrome_height(include_setup=False)
+        self._overlay_compact_height = h
+        x, y = self.winfo_x(), self.winfo_y()
+        try:
+            self.geometry(f"{OVERLAY_WIDTH}x{h}+{x}+{y}")
+        except tk.TclError:
+            pass
+
+    def _overlay_resize_for_setup(self) -> None:
+        if not self._setup_expanded.get():
+            return
+        self._setup_sync_scroll_region()
+        try:
+            body_h = int(self._setup_scroll_body.winfo_reqheight())
+        except tk.TclError:
+            body_h = OVERLAY_SETUP_SCROLL_MAX
+        view_h = min(max(140, body_h + 8), OVERLAY_SETUP_SCROLL_MAX)
+        try:
+            self._setup_scroll_canvas.configure(height=view_h)
+        except tk.TclError:
+            pass
+        h = self._overlay_chrome_height(include_setup=True)
+        x, y = self.winfo_x(), self.winfo_y()
+        try:
+            self.geometry(f"{OVERLAY_WIDTH}x{h}+{x}+{y}")
+        except tk.TclError:
+            pass
+        self._setup_sync_scroll_region()
 
     def _build_setup_form(self, parent: tk.Frame) -> None:
         parent.configure(bg=self._void_bg())
-        ttk.Label(
-            parent,
-            text="List file (SKU, Qty, img): third column = picture path (images/… or full path) or image URL — shown on wheel cells; Pillow required for most formats.",
-        ).pack(anchor=tk.W, padx=4)
+        self._setup_wrap_labels = []
+        card_bg = WHEEL_BG
+        card_edge = WHEEL_CELL_BORDER
+        card = tk.Frame(parent, bg=card_bg, highlightbackground=card_edge, highlightthickness=1)
+        card.pack(fill=tk.X, padx=4, pady=(0, 6))
+        pad = tk.Frame(card, bg=card_bg)
+        pad.pack(fill=tk.X, padx=12, pady=12)
 
-        self._setup_path_row = tk.Frame(parent, bg=self._void_bg())
-        self._setup_path_row.pack(fill=tk.X, pady=(4, 6), padx=4)
-        self._register_void_bg(self._setup_path_row)
+        tk.Label(
+            pad,
+            text="Where are your files?",
+            font=("Segoe UI", 11, "bold"),
+            bg=card_bg,
+            fg=WHEEL_TITLE,
+            anchor=tk.W,
+        ).pack(fill=tk.X)
+        intro = tk.Label(
+            pad,
+            text="Pick the prize spreadsheet and the folder that holds your product photos. "
+            "Status updates as you type or browse.",
+            font=("Segoe UI", 9),
+            bg=card_bg,
+            fg=WHEEL_MUTED,
+            anchor=tk.W,
+            justify=tk.LEFT,
+            wraplength=400,
+        )
+        intro.pack(fill=tk.X, pady=(2, 6))
+        self._setup_wrap_labels.append(intro)
+
+        def _step_block(
+            step_num: int,
+            title: str,
+            hint: str,
+        ) -> tk.Frame:
+            block = tk.Frame(pad, bg=card_bg)
+            block.pack(fill=tk.X, pady=(0, 12))
+            head = tk.Frame(block, bg=card_bg)
+            head.pack(fill=tk.X)
+            tk.Label(
+                head,
+                text=f"Step {step_num}",
+                font=("Segoe UI", 8, "bold"),
+                bg=WHEEL_CELL_BG,
+                fg=WHEEL_POINTER,
+                padx=6,
+                pady=2,
+            ).pack(side=tk.LEFT, padx=(0, 8))
+            tk.Label(
+                head,
+                text=title,
+                font=("Segoe UI", 10, "bold"),
+                bg=card_bg,
+                fg=WHEEL_FG,
+                anchor=tk.W,
+            ).pack(side=tk.LEFT, fill=tk.X)
+            hint_lbl = tk.Label(
+                block,
+                text=hint,
+                font=("Segoe UI", 8),
+                bg=card_bg,
+                fg=WHEEL_MUTED,
+                anchor=tk.W,
+                justify=tk.LEFT,
+                wraplength=400,
+            )
+            hint_lbl.pack(fill=tk.X, pady=(4, 6))
+            self._setup_wrap_labels.append(hint_lbl)
+            return block
+
+        def _path_entry_row(block: tk.Frame, textvariable: tk.StringVar) -> tk.Entry:
+            row = tk.Frame(block, bg=card_bg)
+            row.pack(fill=tk.X)
+            ent = tk.Entry(
+                row,
+                textvariable=textvariable,
+                font=("Segoe UI", 10),
+                bg=INV_SLOT_FACE,
+                fg=WHEEL_FG,
+                insertbackground=WHEEL_FG,
+                relief=tk.FLAT,
+                highlightthickness=1,
+                highlightbackground=card_edge,
+                highlightcolor=WHEEL_POINTER,
+            )
+            ent.pack(side=tk.LEFT, fill=tk.X, expand=True, ipady=4)
+            return ent
+
+        def _action_buttons(
+            block: tk.Frame,
+            *,
+            pick_cmd: object,
+            pick_label: str,
+            open_cmd: object,
+        ) -> None:
+            brow = tk.Frame(block, bg=card_bg)
+            brow.pack(fill=tk.X, pady=(8, 0))
+            tk.Button(
+                brow,
+                text=pick_label,
+                command=pick_cmd,
+                font=("Segoe UI", 9, "bold"),
+                bg=BTN_SPIN,
+                fg="white",
+                activebackground="#3498db",
+                activeforeground="white",
+                relief=tk.FLAT,
+                padx=10,
+                pady=6,
+                cursor="hand2",
+            ).pack(side=tk.LEFT, padx=(0, 8))
+            tk.Button(
+                brow,
+                text="  Open folder  ",
+                command=open_cmd,
+                font=("Segoe UI", 9),
+                bg=WHEEL_CELL_BG,
+                fg=WHEEL_FG,
+                activebackground=WHEEL_POINTER,
+                activeforeground="#1a1a2e",
+                relief=tk.FLAT,
+                padx=8,
+                pady=6,
+                cursor="hand2",
+            ).pack(side=tk.LEFT)
+
+        # Step 1 — prize list
+        block1 = _step_block(
+            1,
+            "Prize list file",
+            "Excel or tab-separated file with SKU, Qty, and optional img column "
+            "(image file name or URL).",
+        )
         self.path_var = tk.StringVar(value=str(draw_prize.default_list_path()))
         self.path_var.trace_add("write", self._on_path_write)
-        self.path_entry = ttk.Entry(self._setup_path_row, textvariable=self.path_var, width=70)
-        self.path_entry.pack(side=tk.LEFT, fill=tk.X, expand=True, padx=(0, 8))
-        ttk.Button(self._setup_path_row, text="Browse…", command=self._browse).pack(side=tk.RIGHT)
+        self.path_entry = _path_entry_row(block1, self.path_var)
+        _action_buttons(
+            block1,
+            pick_cmd=self._browse,
+            pick_label="  Choose prize list…  ",
+            open_cmd=self._open_list_file_folder,
+        )
+        self._setup_list_status = tk.Label(
+            block1,
+            text="",
+            font=("Segoe UI", 9),
+            bg=card_bg,
+            fg=WHEEL_MUTED,
+            anchor=tk.W,
+            justify=tk.LEFT,
+            wraplength=400,
+        )
+        self._setup_list_status.pack(fill=tk.X, pady=(8, 0))
+        self._setup_wrap_labels.append(self._setup_list_status)
+
+        # Step 2 — images folder
+        default_images = script_dir() / "Images"
+        if not default_images.is_dir():
+            default_images = script_dir()
+
+        block2 = _step_block(
+            2,
+            "Images folder",
+            "All pictures for the wheel live here. In the list, img can be just the file name "
+            '(e.g. GrassEnergy.jpg) or a subpath like images/GrassEnergy.jpg.',
+        )
+        self.images_path_var = tk.StringVar(value=str(default_images))
+        self.images_path_var.trace_add("write", self._on_images_path_write)
+        self.images_path_entry = _path_entry_row(block2, self.images_path_var)
+        _action_buttons(
+            block2,
+            pick_cmd=self._browse_images,
+            pick_label="  Choose images folder…  ",
+            open_cmd=self._open_images_folder,
+        )
+        self._setup_images_status = tk.Label(
+            block2,
+            text="",
+            font=("Segoe UI", 9),
+            bg=card_bg,
+            fg=WHEEL_MUTED,
+            anchor=tk.W,
+            justify=tk.LEFT,
+            wraplength=400,
+        )
+        self._setup_images_status.pack(fill=tk.X, pady=(8, 0))
+        self._setup_wrap_labels.append(self._setup_images_status)
+
+        self._build_wheel_preset_panel(
+            pad,
+            bg=card_bg,
+            card_bg=card_bg,
+            border=card_edge,
+            wraplength=400,
+        )
+
+        quick = tk.Frame(pad, bg=card_bg)
+        quick.pack(fill=tk.X, pady=(0, 4))
+        tk.Button(
+            quick,
+            text="  Reset saved session…  ",
+            command=self._setup_reset_persisted_settings,
+            font=("Segoe UI", 9),
+            bg=BTN_KEEP,
+            fg="white",
+            activebackground="#a93226",
+            activeforeground="white",
+            relief=tk.FLAT,
+            padx=8,
+            pady=8,
+            cursor="hand2",
+        ).pack(anchor=tk.W)
 
         self._setup_row2 = tk.Frame(parent, bg=self._void_bg())
         self._setup_row2.pack(fill=tk.X, padx=4, pady=(0, 6))
@@ -1246,6 +1695,93 @@ class DrawPrizeApp(tk.Tk):
         self.out = scrolledtext.ScrolledText(self.log_frame, height=6, wrap=tk.WORD, font=("Consolas", 9))
         self.out.pack(fill=tk.BOTH, expand=True, pady=(2, 0))
 
+        self.after_idle(self._refresh_setup_status)
+        self.after_idle(self._setup_sync_scroll_region)
+
+    def _build_wheel_preset_panel(
+        self,
+        parent: tk.Frame,
+        *,
+        bg: str,
+        card_bg: str,
+        border: str,
+        wraplength: int,
+    ) -> None:
+        """Wheel preset id / match-from-file — Show setup and Spin & controls."""
+        outer = tk.Frame(
+            parent,
+            bg=card_bg,
+            highlightbackground=border,
+            highlightthickness=1,
+        )
+        outer.pack(fill=tk.X, pady=(0, 10))
+        pad = tk.Frame(outer, bg=card_bg)
+        pad.pack(fill=tk.X, padx=10, pady=10)
+        tk.Label(
+            pad,
+            text="Wheel preset",
+            font=("Segoe UI", 9, "bold"),
+            bg=card_bg,
+            fg=WHEEL_POINTER,
+            anchor=tk.W,
+        ).pack(fill=tk.X)
+        tk.Label(
+            pad,
+            text="Type an id (e.g. wheel58912) or Match from file…. Paths are saved in energy_break_state.json. "
+            "Switching presets reuses an existing winner spreadsheet for that wheel when one is in winner_sessions/.",
+            font=("Segoe UI", 8),
+            bg=card_bg,
+            fg=WHEEL_MUTED,
+            anchor=tk.W,
+            justify=tk.LEFT,
+            wraplength=wraplength,
+        ).pack(fill=tk.X, pady=(2, 6))
+        preset_row = tk.Frame(pad, bg=card_bg)
+        preset_row.pack(fill=tk.X)
+        preset_entry = tk.Entry(
+            preset_row,
+            textvariable=self.wheel_preset_var,
+            font=("Segoe UI", 9),
+            bg=INV_SLOT_FACE,
+            fg=WHEEL_FG,
+            insertbackground=WHEEL_FG,
+            highlightthickness=1,
+            highlightbackground=WHEEL_CELL_BG,
+            highlightcolor=WHEEL_POINTER,
+        )
+        preset_entry.pack(side=tk.LEFT, fill=tk.X, expand=True, padx=(0, 8))
+        preset_entry.bind("<Return>", lambda _e: self._setup_apply_wheel_preset())
+        actions = tk.Frame(pad, bg=card_bg)
+        actions.pack(fill=tk.X, pady=(6, 0))
+        tk.Button(
+            actions,
+            text="  Apply preset  ",
+            command=self._setup_apply_wheel_preset,
+            font=("Segoe UI", 9, "bold"),
+            bg=BTN_SPIN,
+            fg="white",
+            activebackground="#3498db",
+            activeforeground="white",
+            relief=tk.FLAT,
+            padx=8,
+            pady=6,
+            cursor="hand2",
+        ).pack(side=tk.LEFT, padx=(0, 8))
+        tk.Button(
+            actions,
+            text="  Match from file…  ",
+            command=self._setup_match_wheel_preset_from_file,
+            font=("Segoe UI", 9),
+            bg=WHEEL_CELL_BG,
+            fg=WHEEL_FG,
+            activebackground=WHEEL_POINTER,
+            activeforeground="#1a1a2e",
+            relief=tk.FLAT,
+            padx=8,
+            pady=6,
+            cursor="hand2",
+        ).pack(side=tk.LEFT)
+
     def _build_spin_controls_inner(self, ctrl_inner: tk.Frame) -> None:
         """Populate the Spin & controls window (also used when recreating that Toplevel)."""
         panel = PRIZE_BOARD_CONTENT_BG
@@ -1262,6 +1798,69 @@ class DrawPrizeApp(tk.Tk):
                 fg=WHEEL_POINTER,
                 anchor=tk.W,
             ).pack(fill=tk.X, pady=(4, 8))
+
+        self._build_wheel_preset_panel(
+            ctrl_inner,
+            bg=panel,
+            card_bg=card_bg,
+            border=edge,
+            wraplength=640,
+        )
+        tk.Label(
+            ctrl_inner,
+            text="Strip wheel + status below; HTML/OBS wheel uses the same live feed.",
+            font=("Segoe UI", 9),
+            bg=panel,
+            fg=WHEEL_MUTED,
+            wraplength=640,
+            justify=tk.LEFT,
+            anchor=tk.W,
+        ).pack(fill=tk.X, pady=(0, 8))
+
+        _section_title("Live wheel")
+        card_live = tk.Frame(ctrl_inner, bg=card_bg, highlightbackground=edge, highlightthickness=1)
+        card_live.pack(fill=tk.X, pady=(0, 14))
+        live_pad = tk.Frame(card_live, bg=card_bg)
+        live_pad.pack(fill=tk.X, padx=14, pady=14)
+        live_chrome = tk.Frame(live_pad, bg=card_bg)
+        live_chrome.pack(fill=tk.X, pady=(0, 8))
+        self._sc_spin_counter_label = tk.Label(
+            live_chrome,
+            text="Spot 1",
+            font=("Segoe UI", 12, "bold"),
+            bg=card_bg,
+            fg=WHEEL_POINTER,
+            anchor=tk.W,
+        )
+        self._sc_spin_counter_label.pack(side=tk.LEFT)
+        self._sc_prizes_label = tk.Label(
+            live_chrome,
+            text="Total prizes: —",
+            font=("Segoe UI", 10, "bold"),
+            bg=card_bg,
+            fg=WHEEL_POINTER,
+            anchor=tk.E,
+        )
+        self._sc_prizes_label.pack(side=tk.RIGHT)
+        self.spin_controls_wheel_canvas = tk.Canvas(
+            live_pad,
+            height=SPIN_CONTROLS_WHEEL_CANVAS_H,
+            bg=WHEEL_BG,
+            highlightthickness=0,
+            bd=0,
+        )
+        self.spin_controls_wheel_canvas.pack(fill=tk.X, expand=False)
+        self.spin_controls_wheel_canvas.bind("<Configure>", self._on_wheel_canvas_configure)
+        self._sc_wheel_status = tk.Label(
+            live_pad,
+            text="",
+            font=("Segoe UI", 9, "italic"),
+            bg=card_bg,
+            fg=WHEEL_FG,
+            wraplength=640,
+            justify=tk.CENTER,
+        )
+        self._sc_wheel_status.pack(fill=tk.X, pady=(8, 0))
 
         _section_title("Draw")
         card_draw = tk.Frame(ctrl_inner, bg=card_bg, highlightbackground=edge, highlightthickness=1)
@@ -1283,6 +1882,32 @@ class DrawPrizeApp(tk.Tk):
             justify=tk.LEFT,
             anchor=tk.W,
         ).pack(fill=tk.X, pady=(0, 12))
+
+        speed_row = tk.Frame(draw_pad, bg=card_bg)
+        speed_row.pack(fill=tk.X, pady=(0, 10))
+        tk.Label(
+            speed_row,
+            text="Spin speed",
+            bg=card_bg,
+            fg=WHEEL_FG,
+            font=("Segoe UI", 9, "bold"),
+        ).pack(side=tk.LEFT, padx=(0, 12))
+        self.wheel_spin_speed_var = tk.StringVar(value="fast")
+        for label, val in (("Fast (~2 s)", "fast"), ("Slow (~4.5 s)", "slow")):
+            tk.Radiobutton(
+                speed_row,
+                text=label,
+                variable=self.wheel_spin_speed_var,
+                value=val,
+                bg=card_bg,
+                fg=WHEEL_FG,
+                activebackground=card_bg,
+                activeforeground=WHEEL_POINTER,
+                selectcolor=WHEEL_CELL_BG,
+                font=("Segoe UI", 9),
+                highlightthickness=0,
+                cursor="hand2",
+            ).pack(side=tk.LEFT, padx=(0, 14))
 
         self.control_bar = tk.Frame(draw_pad, bg=card_bg)
         self.control_bar.pack(fill=tk.X)
@@ -1403,8 +2028,8 @@ class DrawPrizeApp(tk.Tk):
         tk.Label(
             fill_pad,
             text=(
-                "Skipped spot still empty? Choose the spot, then run one normal SPIN — the prize is written into "
-                "that existing row in the winner session file. Cancel fill mode to go back to the latest spot #."
+                "Skipped spot still empty? Click Fill a skipped spot…, pick the row in the list, then run one "
+                "normal SPIN. Cancel fill mode to return to the usual next spot #."
             ),
             bg=card_bg,
             fg=WHEEL_MUTED,
@@ -1412,7 +2037,29 @@ class DrawPrizeApp(tk.Tk):
             wraplength=640,
             justify=tk.LEFT,
             anchor=tk.W,
-        ).pack(fill=tk.X, pady=(0, 10))
+        ).pack(fill=tk.X, pady=(0, 8))
+        self._fill_skipped_hint_label = tk.Label(
+            fill_pad,
+            text="",
+            bg=card_bg,
+            fg=WHEEL_MUTED,
+            font=("Segoe UI", 8),
+            wraplength=640,
+            justify=tk.LEFT,
+            anchor=tk.W,
+        )
+        self._fill_skipped_hint_label.pack(fill=tk.X, pady=(0, 8))
+        self._fill_skipped_status_label = tk.Label(
+            fill_pad,
+            text="",
+            bg=card_bg,
+            fg=WHEEL_POINTER,
+            font=("Segoe UI", 9),
+            wraplength=640,
+            justify=tk.LEFT,
+            anchor=tk.W,
+        )
+        self._fill_skipped_status_label.pack(fill=tk.X, pady=(0, 8))
         fill_btns = tk.Frame(fill_pad, bg=card_bg)
         fill_btns.pack(fill=tk.X)
         tk.Button(
@@ -1478,69 +2125,6 @@ class DrawPrizeApp(tk.Tk):
             pady=10,
             cursor="hand2",
         ).pack(side=tk.LEFT, padx=(0, 10))
-
-        _section_title("New wheel")
-        card_misc = tk.Frame(ctrl_inner, bg=card_bg, highlightbackground=edge, highlightthickness=1)
-        card_misc.pack(fill=tk.X)
-        misc_pad = tk.Frame(card_misc, bg=card_bg)
-        misc_pad.pack(fill=tk.X, padx=14, pady=14)
-        tk.Label(
-            misc_pad,
-            text="When you want to run a new wheel, press Start new wheel. That creates a new Excel file for the next saves.",
-            bg=card_bg,
-            fg=WHEEL_FG,
-            font=("Segoe UI", 9),
-            wraplength=560,
-            justify=tk.LEFT,
-            anchor=tk.W,
-        ).pack(fill=tk.X, pady=(0, 10))
-        name_row = tk.Frame(misc_pad, bg=card_bg)
-        name_row.pack(fill=tk.X, pady=(0, 8))
-        tk.Label(
-            name_row,
-            text="Wheel name",
-            bg=card_bg,
-            fg=WHEEL_FG,
-            font=("Segoe UI", 9, "bold"),
-        ).pack(side=tk.LEFT, padx=(0, 8))
-        self._new_wheel_name_entry = tk.Entry(
-            name_row,
-            textvariable=self._new_wheel_name_var,
-            font=("Segoe UI", 10),
-            width=28,
-            bg=INV_SLOT_FACE,
-            fg=WHEEL_FG,
-            insertbackground=WHEEL_FG,
-            highlightthickness=1,
-            highlightbackground=edge,
-            highlightcolor=WHEEL_POINTER,
-        )
-        self._new_wheel_name_entry.pack(side=tk.LEFT, fill=tk.X, expand=True)
-        tk.Label(
-            misc_pad,
-            text="Optional — letters and numbers are turned into part of the new file name (for example, Friday becomes winners_Friday_….xlsx).",
-            bg=card_bg,
-            fg=WHEEL_MUTED,
-            font=("Segoe UI", 8),
-            wraplength=560,
-            justify=tk.LEFT,
-            anchor=tk.W,
-        ).pack(fill=tk.X, pady=(0, 10))
-        tk.Button(
-            misc_pad,
-            text="  Start new wheel…  ",
-            command=self._start_new_wheel,
-            font=("Segoe UI", 10, "bold"),
-            bg=WHEEL_CELL_BG,
-            fg=WHEEL_FG,
-            activebackground=WHEEL_POINTER,
-            activeforeground="#1a1a2e",
-            relief=tk.FLAT,
-            bd=0,
-            padx=14,
-            pady=10,
-            cursor="hand2",
-        ).pack(anchor=tk.W)
 
         _section_title("Prize board")
         card_pb = tk.Frame(ctrl_inner, bg=card_bg, highlightbackground=edge, highlightthickness=1)
@@ -1806,7 +2390,8 @@ class DrawPrizeApp(tk.Tk):
         self._register_void_bg(compact)
         tk.Label(
             compact,
-            text="Strip wheel + status run in Spin & controls and in the HTML page (OBS).",
+            text="Strip wheel + status run in Spin & controls and in the HTML page (OBS). "
+            "Wheel presets are under Show setup.",
             font=("Segoe UI", 10),
             bg=vb,
             fg=WHEEL_FG,
@@ -1845,6 +2430,36 @@ class DrawPrizeApp(tk.Tk):
         )
         self._spin_controls_title_btn.pack(side=tk.LEFT)
 
+        winner_pick = tk.Frame(compact, bg=vb)
+        winner_pick.pack(fill=tk.X, pady=(10, 0))
+        self._winner_log_path_label = tk.Label(
+            winner_pick,
+            text="",
+            bg=vb,
+            fg=WHEEL_POINTER,
+            font=("Segoe UI", 9, "bold"),
+            wraplength=460,
+            justify=tk.LEFT,
+            anchor=tk.W,
+        )
+        self._winner_log_path_label.pack(fill=tk.X, pady=(0, 6))
+        tk.Button(
+            winner_pick,
+            text="  Choose winner spreadsheet…  ",
+            command=self._choose_winner_session_spreadsheet,
+            font=("Segoe UI", 10, "bold"),
+            bg=BTN_SPIN,
+            fg="white",
+            activebackground="#3498db",
+            activeforeground="white",
+            relief=tk.FLAT,
+            bd=0,
+            padx=12,
+            pady=8,
+            cursor="hand2",
+        ).pack(anchor=tk.W)
+        self.after_idle(self._refresh_winner_log_path_label)
+
         self._overlay_list_outer = tk.Frame(
             compact,
             bg=WHEEL_FRAME_BG,
@@ -1861,6 +2476,15 @@ class DrawPrizeApp(tk.Tk):
             anchor=tk.W,
         )
         self._overlay_list_title.pack(fill=tk.X, padx=8, pady=(8, 4))
+        self._overlay_spot_target_label = tk.Label(
+            self._overlay_list_outer,
+            text="",
+            bg=WHEEL_FRAME_BG,
+            fg=WHEEL_POINTER,
+            font=("Segoe UI", 10, "bold"),
+            anchor=tk.W,
+        )
+        self._overlay_spot_target_label.pack(fill=tk.X, padx=8, pady=(0, 4))
         list_row = tk.Frame(self._overlay_list_outer, bg=WHEEL_FRAME_BG)
         list_row.pack(fill=tk.X, padx=6, pady=(0, 8))
         self._overlay_list_scroll = tk.Scrollbar(
@@ -1954,8 +2578,80 @@ class DrawPrizeApp(tk.Tk):
         self.wheel_status.pack(pady=(0, 6))
         self._register_void_bg(self.wheel_status)
 
+    def _wheel_display_canvases(self) -> list[tk.Canvas]:
+        out: list[tk.Canvas] = []
+        if hasattr(self, "wheel_canvas"):
+            out.append(self.wheel_canvas)
+        sc = getattr(self, "spin_controls_wheel_canvas", None)
+        if sc is not None:
+            try:
+                if sc.winfo_exists():
+                    out.append(sc)
+            except tk.TclError:
+                pass
+        return out
+
+    def _on_spin_controls_wheel_panel_ready(self) -> None:
+        """Refresh live wheel + chrome when Spin & controls opens."""
+        sc = getattr(self, "spin_controls_wheel_canvas", None)
+        if sc is not None:
+            try:
+                if sc.winfo_exists():
+                    sc.configure(height=SPIN_CONTROLS_WHEEL_CANVAS_H)
+            except tk.TclError:
+                pass
+        self._mirror_wheel_chrome()
+        self._schedule_spin_controls_wheel_sync()
+        self._refresh_winner_log_path_label()
+        if hasattr(self, "wheel_canvas"):
+            self._wheel_redraw()
+
+    def _mirror_wheel_chrome(self) -> None:
+        if hasattr(self, "spin_counter_label") and hasattr(self, "_sc_spin_counter_label"):
+            try:
+                self._sc_spin_counter_label.configure(text=str(self.spin_counter_label.cget("text")))
+            except tk.TclError:
+                pass
+        if hasattr(self, "prizes_label") and hasattr(self, "_sc_prizes_label"):
+            try:
+                self._sc_prizes_label.configure(text=str(self.prizes_label.cget("text")))
+            except tk.TclError:
+                pass
+        if hasattr(self, "wheel_status") and hasattr(self, "_sc_wheel_status"):
+            try:
+                self._sc_wheel_status.configure(
+                    text=str(self.wheel_status.cget("text")),
+                    fg=str(self.wheel_status.cget("fg")),
+                )
+            except tk.TclError:
+                pass
+
+    def _set_wheel_status(self, text: str, fg: str = WHEEL_FG) -> None:
+        if hasattr(self, "wheel_status"):
+            try:
+                self.wheel_status.configure(text=text, fg=fg)
+            except tk.TclError:
+                pass
+        sc = getattr(self, "_sc_wheel_status", None)
+        if sc is not None:
+            try:
+                if sc.winfo_exists():
+                    sc.configure(text=text, fg=fg)
+            except tk.TclError:
+                pass
+
     def _on_wheel_canvas_configure(self, _event: tk.Event | None = None) -> None:
-        """Keep the idle preview strip centered under the pointer when the canvas size changes."""
+        """Keep the strip centered under the pointer when the primary (OBS) canvas width changes."""
+        ref_w = self._wheel_reference_viewport_w()
+        cw_px = self._wheel_primary_viewport_w()
+        if abs(cw_px - ref_w) > 0.5:
+            self._wheel_target_scroll = self._wheel_scroll_convert_viewport(
+                float(self._wheel_target_scroll), ref_w, cw_px
+            )
+            self._wheel_scroll = self._wheel_scroll_convert_viewport(
+                float(self._wheel_scroll), ref_w, cw_px
+            )
+            self._wheel_note_scroll_viewport(cw_px)
         if (
             not self._busy
             and self._anim_after is None
@@ -1965,10 +2661,10 @@ class DrawPrizeApp(tk.Tk):
             == int(type(self).WHEEL_IDLE_STRIP_LEN) * int(type(self).WHEEL_IDLE_CAROUSEL_COPIES)
         ):
             mid = self._wheel_win_idx
-            cw_px = max(int(self.wheel_canvas.winfo_width()), 2)
-            self._wheel_target_scroll = self._wheel_scroll_to_center_index(float(mid), float(cw_px))
+            self._wheel_target_scroll = self._wheel_scroll_to_center_index(float(mid), cw_px)
             self._wheel_scroll = self._wheel_target_scroll
             self._wheel_idle_offset = 0.0
+            self._wheel_note_scroll_viewport(cw_px)
         self._wheel_redraw()
 
     def _cancel_wheel_idle_drift(self) -> None:
@@ -2088,8 +2784,39 @@ class DrawPrizeApp(tk.Tk):
                 self._ensure_wheel_photos_for_strip(self._wheel_strip)
             except tk.TclError:
                 pass
+        self._sync_spin_controls_wheel_canvas_height(ch)
         if resized:
             self._on_wheel_canvas_configure()
+
+    def _sync_spin_controls_wheel_canvas_height(self, controls_win_h: int | None = None) -> None:
+        """Keep the Spin & controls live preview compact (not tied to hidden wheel / OBS canvas height)."""
+        sc = getattr(self, "spin_controls_wheel_canvas", None)
+        if sc is None:
+            return
+        try:
+            if not sc.winfo_exists():
+                return
+        except tk.TclError:
+            return
+        base = SPIN_CONTROLS_WHEEL_CANVAS_H
+        h_max = SPIN_CONTROLS_WHEEL_CANVAS_H_MAX
+        h_min = int(type(self).WHEEL_CANVAS_H_LINK_MIN)
+        if controls_win_h is not None and controls_win_h >= 340:
+            ref = self._wheel_control_link_ref
+            if ref is not None:
+                ref_ch, _ref_canvas_h = ref
+                # Slight growth when the window is tall, but capped well below the OBS wheel.
+                base = max(h_min, min(h_max, base + int((controls_win_h - ref_ch) * 0.12)))
+        try:
+            cur = int(sc.cget("height"))
+        except tk.TclError:
+            cur = 0
+        if cur != base:
+            try:
+                sc.configure(height=base)
+                self._wheel_redraw()
+            except tk.TclError:
+                pass
 
     def _btn_set_busy(self, btn: tk.Button, busy: bool) -> None:
         if busy:
@@ -2109,6 +2836,59 @@ class DrawPrizeApp(tk.Tk):
             return sum(q for _, q, _ in rows)
         except (draw_prize.PrizeDrawError, OSError, ValueError, TypeError):
             return None
+
+    def _setup_paths_spin_block_reason(self) -> str | None:
+        """None when prize list and images folder are set and exist."""
+        if not hasattr(self, "path_var"):
+            return None
+        list_raw = self.path_var.get().strip()
+        if not list_raw:
+            return "Set a prize list in Show setup or apply a wheel preset."
+        try:
+            list_p = Path(list_raw).expanduser().resolve()
+        except OSError:
+            return "Prize list path is invalid."
+        if not list_p.is_file():
+            return f"Prize list not found ({list_p.name})."
+        if not hasattr(self, "images_path_var"):
+            return None
+        images_raw = self.images_path_var.get().strip()
+        if not images_raw:
+            return "Set an images folder in Show setup or apply a wheel preset."
+        try:
+            images_p = Path(images_raw).expanduser().resolve()
+        except OSError:
+            return "Images folder path is invalid."
+        if not images_p.is_dir():
+            return f"Images folder not found ({images_p.name})."
+        return None
+
+    def _winner_session_spin_block_reason(self) -> str | None:
+        """None when SPIN / Super / Skip may write to the active winner session workbook."""
+        paths_block = self._setup_paths_spin_block_reason()
+        if paths_block is not None:
+            return paths_block
+        if Workbook is None or load_workbook is None:
+            return (
+                "A winner session Excel file is required before spinning. "
+                "Install openpyxl, then apply a wheel preset or choose a winner spreadsheet on the main tab."
+            )
+        path = getattr(self, "_winner_log_path", None)
+        if path is None:
+            return (
+                "No winner session file is ready. Apply a wheel preset or choose a spreadsheet "
+                "so each spin can be saved."
+            )
+        p = Path(path)
+        if not p.is_file():
+            return (
+                f"Winner session file is missing ({p.name}). "
+                "Apply the wheel preset again or choose a spreadsheet."
+            )
+        return None
+
+    def _winner_session_ready_for_spin(self) -> bool:
+        return self._winner_session_spin_block_reason() is None
 
     def _winnable_units_total(self) -> int | None:
         """Units still in the draw (sum of positive quantities). None if the list file cannot be read."""
@@ -2143,29 +2923,16 @@ class DrawPrizeApp(tk.Tk):
             "Add stock to your prize list file, then save — new draws will unlock automatically."
         )
         self._wheel_banner_is_error = False
-        self.wheel_canvas.delete("all")
-        w = max(int(self.wheel_canvas.winfo_width()), 400)
-        h = int(self.wheel_canvas.cget("height"))
-        self.wheel_canvas.create_text(
-            w / 2,
-            h / 2 - 10,
-            text="All prizes have been given out",
-            fill=WHEEL_STRIP_WIN_RING,
-            font=self._title_font,
-            width=w - 40,
+        self._wheel_paint_banner_on_canvases(
+            "All prizes have been given out",
+            "Add stock to your prize list file, then save — new draws will unlock automatically.",
+            is_error=False,
+            title_y_offset=-10,
+            subtitle_y_offset=22,
         )
-        self.wheel_canvas.create_text(
-            w / 2,
-            h / 2 + 22,
-            text="Add stock to your prize list file, then save — new draws will unlock automatically.",
-            fill=WHEEL_STRIP_FG,
-            font=("Segoe UI", 10),
-            width=w - 48,
-        )
-        self._wheel_draw_strip_pointer(self.wheel_canvas, w / 2.0, float(WHEEL_STRIP_PAD_TOP))
-        self.wheel_status.configure(
-            text="There are no prizes left on the wheel. Reload your list with more quantities to keep going.",
-            fg=WHEEL_TITLE,
+        self._set_wheel_status(
+            "There are no prizes left on the wheel. Reload your list with more quantities to keep going.",
+            WHEEL_TITLE,
         )
         self._wheel_publish_html_snapshot()
 
@@ -2180,6 +2947,7 @@ class DrawPrizeApp(tk.Tk):
         self._wheel_win_idx = mid
         self._wheel_target_scroll = self._wheel_scroll_to_center_index(float(mid), float(cw_px))
         self._wheel_scroll = self._wheel_target_scroll
+        self._wheel_note_scroll_viewport(cw_px)
 
         def _fallback_strip() -> None:
             self._wheel_sku_to_img = {}
@@ -2190,17 +2958,17 @@ class DrawPrizeApp(tk.Tk):
             p = self._list_path()
         except OSError:
             _fallback_strip()
-            self.wheel_status.configure(
-                text="SPIN = save now · SUPER SPIN = Reroll/Keep buttons appear after the wheel stops (no save until Keep)",
-                fg=WHEEL_FG,
+            self._set_wheel_status(
+                "SPIN = save now · SUPER SPIN = Reroll/Keep buttons appear after the wheel stops (no save until Keep)",
+                WHEEL_FG,
             )
             self.after_idle(self._wheel_redraw)
             return
         if not p.is_file():
             _fallback_strip()
-            self.wheel_status.configure(
-                text="SPIN = save now · SUPER SPIN = Reroll/Keep buttons appear after the wheel stops (no save until Keep)",
-                fg=WHEEL_FG,
+            self._set_wheel_status(
+                "SPIN = save now · SUPER SPIN = Reroll/Keep buttons appear after the wheel stops (no save until Keep)",
+                WHEEL_FG,
             )
             self.after_idle(self._wheel_redraw)
             return
@@ -2208,9 +2976,9 @@ class DrawPrizeApp(tk.Tk):
             _, rows = draw_prize.load_rows(p)
         except draw_prize.PrizeDrawError:
             _fallback_strip()
-            self.wheel_status.configure(
-                text="SPIN = save now · SUPER SPIN = Reroll/Keep buttons appear after the wheel stops (no save until Keep)",
-                fg=WHEEL_FG,
+            self._set_wheel_status(
+                "SPIN = save now · SUPER SPIN = Reroll/Keep buttons appear after the wheel stops (no save until Keep)",
+                WHEEL_FG,
             )
             self.after_idle(self._wheel_redraw)
             return
@@ -2224,9 +2992,9 @@ class DrawPrizeApp(tk.Tk):
             self._wheel_strip = first + first
             self._ensure_wheel_photos_for_strip(self._wheel_strip)
 
-        self.wheel_status.configure(
-            text="SPIN = save now · SUPER SPIN = Reroll/Keep buttons appear after the wheel stops (no save until Keep)",
-            fg=WHEEL_FG,
+        self._set_wheel_status(
+            "SPIN = save now · SUPER SPIN = Reroll/Keep buttons appear after the wheel stops (no save until Keep)",
+            WHEEL_FG,
         )
         self.after_idle(self._wheel_redraw)
 
@@ -2237,10 +3005,22 @@ class DrawPrizeApp(tk.Tk):
         depleted = units is not None and units == 0
         if depleted:
             self._style_buttons_depleted()
+        elif not self._winner_session_ready_for_spin():
+            self._style_buttons_no_winner_log()
         elif self._pending_super is not None:
             self._style_super_controls_active()
         else:
             self._style_main_controls_idle()
+
+    def _style_buttons_no_winner_log(self) -> None:
+        """Draw actions disabled until a winner session workbook exists on disk."""
+        if not hasattr(self, "spin_btn"):
+            return
+        self._hide_super_reroll_keep_buttons()
+        self.spin_btn.config(state=tk.DISABLED, bg=BTN_DISABLED)
+        self.super_btn.config(state=tk.DISABLED, bg=BTN_DISABLED)
+        self.skip_spot_btn.config(state=tk.DISABLED, bg=BTN_DISABLED)
+        self._sync_undo_spin_button()
 
     def _reconcile_depleted_wheel_if_applicable(self) -> None:
         if not hasattr(self, "wheel_canvas"):
@@ -2390,9 +3170,17 @@ class DrawPrizeApp(tk.Tk):
             return
         n = self._total_qty_remaining()
         if n is None:
-            self.prizes_label.configure(text="Total prizes: —")
+            text = "Total prizes: —"
         else:
-            self.prizes_label.configure(text=f"Total prizes: {n}")
+            text = f"Total prizes: {n}"
+        self.prizes_label.configure(text=text)
+        sc = getattr(self, "_sc_prizes_label", None)
+        if sc is not None:
+            try:
+                if sc.winfo_exists():
+                    sc.configure(text=text)
+            except tk.TclError:
+                pass
         self._update_draw_buttons_for_supply()
         self._reconcile_depleted_wheel_if_applicable()
         self._refresh_remaining_skus_panel()
@@ -2445,6 +3233,58 @@ class DrawPrizeApp(tk.Tk):
         self._winner_overlay_last_sig = sig
         self._refresh_overlay_winner_session_list()
 
+    def _overlay_winner_active_spot(self) -> int | None:
+        """Spot # the next SPIN will write to, or the row being filled in fill-skip mode."""
+        bf = getattr(self, "_backfill_target_spot", None)
+        if bf is not None:
+            try:
+                return int(bf)
+            except (TypeError, ValueError):
+                pass
+        try:
+            return int(self._winner_next_spin)
+        except (TypeError, ValueError):
+            return None
+
+    def _overlay_spot_target_caption(self) -> str:
+        active = self._overlay_winner_active_spot()
+        if active is None:
+            return ""
+        if getattr(self, "_backfill_target_spot", None) is not None:
+            return f"▶  Filling Spot {active} in the session sheet (arrow in list below)"
+        return f"▶  Next spin writes Spot {active} (arrow in list below)"
+
+    def _apply_overlay_list_active_highlight(self) -> None:
+        """Highlight the row for the active spot and scroll it into view."""
+        if not hasattr(self, "_overlay_listbox"):
+            return
+        lb = self._overlay_listbox
+        active = self._overlay_winner_active_spot()
+        spots = getattr(self, "_overlay_list_line_spots", ())
+        active_idx: int | None = None
+        if active is not None:
+            for i, sp in enumerate(spots):
+                if sp == active:
+                    active_idx = i
+                    break
+        try:
+            for i in range(lb.size()):
+                lb.itemconfig(i, bg=WHEEL_CELL_BG, fg=WHEEL_FG)
+            if active_idx is not None:
+                lb.itemconfig(active_idx, bg=WHEEL_POINTER, fg="#1a1a2e")
+                lb.selection_clear(0, tk.END)
+                lb.selection_set(active_idx)
+                lb.see(active_idx)
+        except tk.TclError:
+            pass
+        hint = getattr(self, "_overlay_spot_target_label", None)
+        if hint is not None:
+            try:
+                cap = self._overlay_spot_target_caption()
+                hint.configure(text=cap if cap else "")
+            except tk.TclError:
+                pass
+
     def _refresh_overlay_winner_session_list(self) -> None:
         """Operator-facing rows from the latest / active winner session Excel (main overlay tab).
 
@@ -2454,6 +3294,8 @@ class DrawPrizeApp(tk.Tk):
             return
         lb = self._overlay_listbox
         title = getattr(self, "_overlay_list_title", None)
+        self._overlay_list_line_spots = []
+        active_spot = self._overlay_winner_active_spot()
         try:
             lb.delete(0, tk.END)
             path = self._winner_session_workbook_for_overlay()
@@ -2466,11 +3308,13 @@ class DrawPrizeApp(tk.Tk):
                 lb.insert(tk.END, "Install openpyxl to view the wheel log.")
                 self._set_overlay_winner_list_height()
                 self._resize_overlay_to_fit_list()
+                self._apply_overlay_list_active_highlight()
                 return
             if path is None or not path.is_file():
-                lb.insert(tk.END, "(No winners_*.xlsx in winner_sessions yet)")
+                lb.insert(tk.END, "(No winner session .xlsx in winner_sessions yet)")
                 self._set_overlay_winner_list_height()
                 self._resize_overlay_to_fit_list()
+                self._apply_overlay_list_active_highlight()
                 return
             try:
                 wb = load_workbook(path, read_only=True, data_only=True)
@@ -2479,7 +3323,7 @@ class DrawPrizeApp(tk.Tk):
                     if ws is None:
                         lb.insert(tk.END, "(Empty workbook)")
                     else:
-                        lines: list[str] = []
+                        sheet_rows: list[tuple[int, str, str]] = []
                         for row in ws.iter_rows(min_row=2, max_col=2, values_only=True):
                             a = row[0] if row else None
                             b = row[1] if row and len(row) > 1 else None
@@ -2487,27 +3331,46 @@ class DrawPrizeApp(tk.Tk):
                                 continue
                             try:
                                 if a is not None and str(a).strip() != "":
-                                    spot_s = f"Spot {int(a)}"
+                                    spot_n = int(a)
+                                    spot_s = f"Spot {spot_n}"
                                 else:
+                                    spot_n = -1
                                     spot_s = str(a).strip() if a is not None else "—"
                             except (TypeError, ValueError):
+                                spot_n = -1
                                 spot_s = str(a).strip() if a is not None else "—"
                             if b is None or (isinstance(b, str) and not b.strip()) or b == "":
                                 prize = "—"
                             else:
                                 prize = str(b).strip()
-                            lines.append(f"{spot_s}  —  {prize}")
-                        if not lines:
+                            sheet_rows.append((spot_n, spot_s, prize))
+                        if not sheet_rows:
                             lb.insert(tk.END, "(No winners logged yet in this session)")
                         else:
-                            for line in reversed(lines):
-                                lb.insert(tk.END, line)
+                            spots_in_sheet = {n for n, _, _ in sheet_rows if n > 0}
+                            if (
+                                active_spot is not None
+                                and active_spot not in spots_in_sheet
+                                and getattr(self, "_backfill_target_spot", None) is None
+                            ):
+                                pending = f"▶  Spot {active_spot}  —  (next spin — not in sheet yet)"
+                                lb.insert(tk.END, pending)
+                                self._overlay_list_line_spots.append(active_spot)
+                            for spot_n, spot_s, prize in reversed(sheet_rows):
+                                is_active = active_spot is not None and spot_n == active_spot
+                                prefix = "▶  " if is_active else "    "
+                                lb.insert(tk.END, f"{prefix}{spot_s}  —  {prize}")
+                                self._overlay_list_line_spots.append(
+                                    spot_n if spot_n > 0 else None
+                                )
                 finally:
                     wb.close()
             except Exception as e:
                 lb.insert(tk.END, f"Could not read workbook: {e}")
             self._set_overlay_winner_list_height()
             self._resize_overlay_to_fit_list()
+            self._apply_overlay_list_active_highlight()
+            self._refresh_fill_skipped_hint()
         finally:
             try:
                 p2 = self._winner_session_workbook_for_overlay()
@@ -2549,20 +3412,37 @@ class DrawPrizeApp(tk.Tk):
         rows: list[tuple[str, int, str]],
         winner: str,
     ) -> tuple[list[str], int, float]:
-        n = self.WHEEL_STRIP_LEN
-        win_idx = random.randint(18, min(28, n - 6))
-        strip = draw_prize.build_wheel_spin_strip(
-            rows,
-            n,
-            winner=winner,
-            win_idx=win_idx,
+        self._wheel_dense_pack_active = True
+        lap_n = int(type(self).WHEEL_SPIN_LAP_LEN)
+        laps = int(type(self).WHEEL_SPIN_LAPS)
+        parts: list[str] = []
+        for _lap in range(max(1, laps) - 1):
+            deco = draw_prize.sample_skus_weighted(rows, 1)
+            deco_w = deco[0] if deco else winner
+            deco_idx = random.randint(4, max(4, lap_n - 5))
+            parts.extend(
+                draw_prize.build_wheel_spin_strip(
+                    rows, lap_n, winner=deco_w, win_idx=deco_idx
+                )
+            )
+        win_local = random.randint(max(14, lap_n - 10), max(15, lap_n - 3))
+        parts.extend(
+            draw_prize.build_wheel_spin_strip(
+                rows, lap_n, winner=winner, win_idx=win_local
+            )
         )
+        strip = parts
+        physical_win_idx = (max(1, laps) - 1) * lap_n + win_local
         w = max(int(self.wheel_canvas.winfo_width()), 520)
-        target = self._wheel_scroll_to_center_index(float(win_idx), float(w))
-        return strip, win_idx, max(0.0, target)
+        target = self._wheel_scroll_to_center_index(
+            float(physical_win_idx), float(w), dense=True
+        )
+        self._wheel_note_scroll_viewport(float(w))
+        return strip, physical_win_idx, max(0.0, target)
 
     def _wheel_loading_preview_setup(self, cells: int | None = None) -> None:
         """While waiting on the worker, show random winnable SKUs (potential hits) instead of placeholders."""
+        self._wheel_dense_pack_active = True
         self._cancel_wheel_idle_drift()
         if cells is None:
             cells = int(type(self).WHEEL_LOADING_STRIP_LEN)
@@ -2575,8 +3455,12 @@ class DrawPrizeApp(tk.Tk):
         def _center_strip(strip: list[str]) -> None:
             self._wheel_strip = strip
             self._wheel_win_idx = win_idx
-            self._wheel_target_scroll = self._wheel_scroll_to_center_index(float(win_idx), float(cw_px))
+            dense = bool(getattr(self, "_wheel_dense_pack_active", False))
+            self._wheel_target_scroll = self._wheel_scroll_to_center_index(
+                float(win_idx), float(cw_px), dense=dense
+            )
             self._wheel_scroll = self._wheel_target_scroll
+            self._wheel_note_scroll_viewport(cw_px)
 
         try:
             p = self._list_path()
@@ -2621,35 +3505,68 @@ class DrawPrizeApp(tk.Tk):
             width=1,
         )
 
-    def _wheel_redraw(self, _idle_drift_frame: bool = False) -> None:
-        if len(self._wheel_strip) > 0:
-            self._wheel_banner_title = None
-            self._wheel_banner_subtitle = None
-            self._wheel_banner_is_error = False
-        c = self.wheel_canvas
+    def _wheel_paint_banner_on_canvases(
+        self,
+        title: str,
+        subtitle: str = "",
+        *,
+        is_error: bool = False,
+        title_y_offset: float = 0.0,
+        subtitle_y_offset: float = 0.0,
+    ) -> None:
+        title_fill = WHEEL_ACCENT if is_error else WHEEL_STRIP_WIN_RING
+        for c in self._wheel_display_canvases():
+            c.delete("all")
+            h = int(c.cget("height"))
+            w = max(int(c.winfo_width()), 2)
+            cx = w / 2.0
+            cy = h / 2.0
+            c.create_text(
+                cx,
+                cy + title_y_offset,
+                text=title,
+                fill=title_fill,
+                font=self._title_font,
+                width=max(40, w - 40),
+            )
+            if subtitle:
+                c.create_text(
+                    cx,
+                    cy + subtitle_y_offset,
+                    text=subtitle,
+                    fill=WHEEL_STRIP_FG,
+                    font=("Segoe UI", 10),
+                    width=max(48, w - 48),
+                )
+            self._wheel_draw_strip_pointer(c, cx, float(WHEEL_STRIP_PAD_TOP))
+
+    def _wheel_redraw_to_canvas(self, c: tk.Canvas, *, _idle_drift_frame: bool = False) -> None:
         c.delete("all")
         h = int(c.cget("height"))
         w = max(int(c.winfo_width()), 2)
         cx = w / 2.0
-        scroll_vis = self._wheel_scroll_for_strip_render()
-        scroll_model = float(self._wheel_scroll)
+        scroll_vis = self._wheel_scroll_for_strip_render_on_canvas(c)
+        scroll_model = self._wheel_scroll_for_canvas(c, float(self._wheel_scroll))
+        target_canvas = self._wheel_scroll_for_canvas(c, float(self._wheel_target_scroll))
         cw = float(self.WHEEL_CELL)
-        pl, pr = self._wheel_cell_xmargins()
+        dense = bool(getattr(self, "_wheel_dense_pack_active", False))
+        pl, pr = self._wheel_cell_xmargins(dense=dense)
         pad_top = float(WHEEL_STRIP_PAD_TOP)
         pad_bot = float(WHEEL_STRIP_PAD_BOTTOM)
         cell_h = max(32.0, float(h) - pad_top - pad_bot)
-        landed = abs(scroll_model - self._wheel_target_scroll) < 1.5
-        gap = WHEEL_STRIP_CELL_GAP
+        landed = abs(scroll_model - target_canvas) < 1.5
+        gap = float(type(self).WHEEL_SPIN_CELL_GAP if dense else WHEEL_STRIP_CELL_GAP)
 
         y_track = min(float(h) - 3.0, pad_top + cell_h + 3.0)
         c.create_line(0, y_track, w, y_track, fill=WHEEL_STRIP_TRACK, width=1)
 
         n_idle_phys = int(type(self).WHEEL_IDLE_STRIP_LEN) * int(type(self).WHEEL_IDLE_CAROUSEL_COPIES)
         idle_carousel = len(self._wheel_strip) == n_idle_phys
+        edge_pad = cw if dense else 0.0
         for i, raw in enumerate(self._wheel_strip):
             x0 = i * cw - scroll_vis + pl
             x1 = i * cw - scroll_vis + cw - pr
-            if x1 < 0 or x0 > w:
+            if x1 < -edge_pad or x0 > w + edge_pad:
                 continue
             rx0, rx1 = x0 + gap, x1 - gap
             if rx1 <= rx0 + 1.0:
@@ -2694,6 +3611,14 @@ class DrawPrizeApp(tk.Tk):
                 )
 
         self._wheel_draw_strip_pointer(c, cx, pad_top)
+
+    def _wheel_redraw(self, _idle_drift_frame: bool = False) -> None:
+        if len(self._wheel_strip) > 0:
+            self._wheel_banner_title = None
+            self._wheel_banner_subtitle = None
+            self._wheel_banner_is_error = False
+        for c in self._wheel_display_canvases():
+            self._wheel_redraw_to_canvas(c, _idle_drift_frame=_idle_drift_frame)
         self._wheel_publish_html_snapshot()
         if (
             not _idle_drift_frame
@@ -2710,6 +3635,7 @@ class DrawPrizeApp(tk.Tk):
         self._cancel_wheel_idle_drift()
         self._clear_obs_wheel_result()
         self._wheel_pulse_highlight = False
+        self._wheel_dense_pack_active = False
         units = self._winnable_units_total()
         if units is not None and units == 0:
             self._update_draw_buttons_for_supply()
@@ -2766,19 +3692,8 @@ class DrawPrizeApp(tk.Tk):
         self._wheel_banner_title = str(message)
         self._wheel_banner_subtitle = ""
         self._wheel_banner_is_error = True
-        self.wheel_canvas.delete("all")
-        w = max(int(self.wheel_canvas.winfo_width()), 400)
-        h = int(self.wheel_canvas.cget("height"))
-        self.wheel_canvas.create_text(
-            w / 2,
-            h / 2 + 6,
-            text=message,
-            fill=WHEEL_ACCENT,
-            font=self._title_font,
-            width=w - 40,
-        )
-        self._wheel_draw_strip_pointer(self.wheel_canvas, w / 2.0, float(WHEEL_STRIP_PAD_TOP))
-        self.wheel_status.configure(text=message, fg=WHEEL_ACCENT)
+        self._wheel_paint_banner_on_canvases(message, is_error=True, title_y_offset=6.0)
+        self._set_wheel_status(message, WHEEL_ACCENT)
         self._style_main_controls_idle()
         self._wheel_publish_html_snapshot()
 
@@ -2830,27 +3745,25 @@ class DrawPrizeApp(tk.Tk):
         self._wheel_sku_to_img = dict(sku_to_img) if sku_to_img else {}
         self._ensure_wheel_photos_for_strip(self._wheel_strip)
         self._wheel_scroll = 0.0
+        self._wheel_note_scroll_viewport(self._wheel_primary_viewport_w())
         self._wheel_pulse_highlight = False
-        self.wheel_status.configure(text="Wheel spinning…", fg=WHEEL_TITLE)
+        self._set_wheel_status("Wheel spinning…", WHEEL_TITLE)
         self._wheel_redraw()
 
         start = time.monotonic()
-        dur = float(type(self).WHEEL_SPIN_DURATION_SEC)
-        ease_pow = float(type(self).WHEEL_SPIN_EASE_OUT_POWER)
+        dur = self._wheel_spin_duration_sec()
         tick_ms = int(type(self).WHEEL_SPIN_TICK_MS)
         target = self._wheel_target_scroll
 
         def tick() -> None:
             elapsed = time.monotonic() - start
             t = min(1.0, elapsed / dur)
-            # ease-out polynomial: lower power = less time crawling at near-zero speed before landing.
-            omt = 1.0 - t
-            ease = 1.0 - omt**ease_pow
+            ease = type(self)._wheel_spin_ease(t)
             self._wheel_scroll = target * ease
             self._wheel_redraw()
             if t >= 1.0:
                 self._anim_after = None
-                self.wheel_status.configure(text=subtitle, fg=WHEEL_FG)
+                self._set_wheel_status(subtitle, WHEEL_FG)
                 done()
             else:
                 self._anim_after = self.after(tick_ms, tick)
@@ -2860,7 +3773,7 @@ class DrawPrizeApp(tk.Tk):
     def _list_path(self) -> Path:
         t = self.path_var.get().strip()
         if not t:
-            return draw_prize.default_list_path()
+            raise OSError("Prize list path is not set")
         return Path(t).expanduser().resolve()
 
     def _maybe_refresh_idle_wheel(self) -> None:
@@ -2881,6 +3794,7 @@ class DrawPrizeApp(tk.Tk):
             self._clear_undo_spin()
             self._refresh_prizes_label()
             self._maybe_refresh_idle_wheel()
+            self._refresh_setup_status()
             return
         if self._session_target and key != self._session_target:
             self._hide_super_panel()
@@ -2888,6 +3802,12 @@ class DrawPrizeApp(tk.Tk):
         self._clear_undo_spin()
         self._refresh_prizes_label()
         self._maybe_refresh_idle_wheel()
+        self._refresh_setup_status()
+        if self._setup_expanded.get():
+            self.after_idle(self._overlay_resize_for_setup)
+        else:
+            self.after_idle(self._setup_sync_scroll_region)
+        self._schedule_save_app_state()
 
     def _log(self, text: str) -> None:
         self.out.insert(tk.END, text)
@@ -2897,14 +3817,72 @@ class DrawPrizeApp(tk.Tk):
     def _find_latest_winner_session_path(base: Path) -> Path | None:
         if not base.is_dir():
             return None
-        paths = list(base.glob("winners_*.xlsx"))
+        paths = [p for p in base.glob("*.xlsx") if p.is_file()]
         if not paths:
             return None
         return max(paths, key=lambda p: p.stat().st_mtime)
 
     @staticmethod
+    def _winner_session_stem_matches_wheel(stem: str, slug: str) -> bool:
+        """True if an existing winner_sessions .xlsx belongs to this wheel id."""
+        s = (stem or "").casefold()
+        slug_cf = (slug or "").casefold()
+        if not s or not slug_cf:
+            return False
+        return (
+            s.startswith(f"{slug_cf}_winners")
+            or s.startswith(f"winners_{slug_cf}_")
+            or s == slug_cf
+        )
+
+    def _find_existing_winner_session_for_wheel(
+        self, wid: str, base: Path | None = None
+    ) -> Path | None:
+        """Newest winner_sessions workbook for this wheel, if any."""
+        slug = self._wheel_name_slug_for_filename(wid)
+        if not slug:
+            return None
+        root = (base if base is not None else script_dir() / "winner_sessions").resolve()
+        if not root.is_dir():
+            return None
+        candidates: list[Path] = []
+        for p in root.glob("*.xlsx"):
+            if not p.is_file():
+                continue
+            if not self._winner_session_stem_matches_wheel(p.stem, slug):
+                continue
+            try:
+                self._next_winner_spot_from_workbook(p)
+            except Exception:
+                continue
+            candidates.append(p)
+        if not candidates:
+            return None
+        return max(candidates, key=lambda p: p.stat().st_mtime)
+
+    @classmethod
+    def _winner_session_filename_stamp(cls, dt: datetime | None = None) -> str:
+        """Month_day and hour-minute AM/PM in Texas (Central) time, e.g. May_16_3-45PM."""
+        when = dt or datetime.now(cls.TEXAS_TZ)
+        if when.tzinfo is None:
+            when = when.replace(tzinfo=cls.TEXAS_TZ)
+        else:
+            when = when.astimezone(cls.TEXAS_TZ)
+        month_day = f"{when.strftime('%B')}_{when.day}"
+        hour = int(when.strftime("%I"))
+        minute = when.strftime("%M")
+        ampm = when.strftime("%p")
+        return f"{month_day}_{hour}-{minute}{ampm}"
+
+    @classmethod
+    def _winner_session_workbook_basename(cls, wheel_id_slug: str) -> str:
+        """e.g. Wheel58912_winners_May_16_3-45PM"""
+        slug = (wheel_id_slug or "").strip() or "wheel"
+        return f"{slug}_winners_{cls._winner_session_filename_stamp()}"
+
+    @staticmethod
     def _wheel_name_slug_for_filename(raw: str, max_len: int = 40) -> str:
-        """ASCII slug for winners_<slug>_<timestamp>.xlsx; empty string if nothing usable remains."""
+        """ASCII slug for <wheel>_winners_<date_time>.xlsx; empty string if nothing usable remains."""
         s = (raw or "").strip()
         if not s:
             return ""
@@ -3107,6 +4085,7 @@ class DrawPrizeApp(tk.Tk):
             )
         self._backfill_target_spot = int(spot_number)
         self._update_spin_counter_label()
+        self._refresh_overlay_winner_session_list()
         self._wheel_publish_html_snapshot()
         nxt = self._winner_next_spin
         self._log(
@@ -3121,14 +4100,44 @@ class DrawPrizeApp(tk.Tk):
             return
         self._backfill_target_spot = None
         self._update_spin_counter_label()
+        self._refresh_overlay_winner_session_list()
         self._wheel_publish_html_snapshot()
+        self._set_fill_skipped_status("")
         if not silent:
             self._log("Fill-skip mode cancelled — using normal next spot again.\n")
+
+    def _refresh_fill_skipped_hint(self) -> None:
+        lab = getattr(self, "_fill_skipped_hint_label", None)
+        if lab is None:
+            return
+        try:
+            spots = self.list_skipped_spots_eligible_for_fill()
+        except Exception:
+            spots = []
+        if spots:
+            shown = ", ".join(f"#{s}" for s in spots[:16])
+            extra = f" (+{len(spots) - 16} more)" if len(spots) > 16 else ""
+            lab.configure(text=f"Empty prize in sheet: {shown}{extra}")
+        else:
+            lab.configure(text="No skipped spots with an empty prize in the active session file.")
+
+    def _set_fill_skipped_status(self, text: str, *, ok: bool = True) -> None:
+        lab = getattr(self, "_fill_skipped_status_label", None)
+        if lab is None:
+            return
+        try:
+            lab.configure(text=text, fg=WHEEL_POINTER if ok else WHEEL_ACCENT)
+        except tk.TclError:
+            pass
 
     def _open_fill_skipped_spot_dialog(self) -> None:
         """Pick a skipped spot from the winner session, then use normal SPIN to write the prize into that row."""
         if self._busy or self._pending_super is not None:
             messagebox.showinfo("Fill skipped spot", "Finish the current spin first.")
+            return
+        block = self._winner_session_spin_block_reason()
+        if block:
+            messagebox.showinfo("Fill skipped spot", block)
             return
         spots = self.list_skipped_spots_eligible_for_fill()
         if not spots:
@@ -3145,7 +4154,7 @@ class DrawPrizeApp(tk.Tk):
         top.grab_set()
         tk.Label(
             top,
-            text="Choose a spot that was skipped (empty prize). Then press SPIN on the main controls.",
+            text="Choose a spot that was skipped (empty prize). Then press SPIN on the draw controls.",
             bg=PRIZE_BOARD_CONTENT_BG,
             fg=WHEEL_FG,
             font=("Segoe UI", 10),
@@ -3165,31 +4174,29 @@ class DrawPrizeApp(tk.Tk):
         for s in spots:
             lb.insert(tk.END, f"Spot {s}  —  (empty)")
         lb.pack(fill=tk.BOTH, expand=True, padx=14, pady=4)
+        if spots:
+            lb.selection_set(0)
+            lb.activate(0)
         btn_row = tk.Frame(top, bg=PRIZE_BOARD_CONTENT_BG)
         btn_row.pack(fill=tk.X, padx=14, pady=(4, 14))
 
         def arm() -> None:
             sel = lb.curselection()
             if not sel:
-                messagebox.showinfo("Fill skipped spot", "Select a spot in the list first.")
+                messagebox.showinfo("Fill skipped spot", "Select a spot in the list first.", parent=top)
                 return
-            idx = int(sel[0])
-            spot_n = spots[idx]
+            spot_n = spots[int(sel[0])]
             err = self.prepare_spin_for_skipped_spot(spot_n)
             if err:
-                messagebox.showerror("Fill skipped spot", err)
+                messagebox.showerror("Fill skipped spot", err, parent=top)
                 return
-            try:
-                top.grab_release()
-            except tk.TclError:
-                pass
-            top.destroy()
-            messagebox.showinfo(
-                "Fill skipped spot",
-                f"Spot #{spot_n} is armed. Press SPIN once; the prize will be saved to that row.\n\n"
-                f"Afterwards the wheel returns to the normal next spot (#{self._winner_next_spin}).",
+            _close_fill_skipped_dialog(top)
+            self._set_fill_skipped_status(
+                f"Spot #{spot_n} armed — press SPIN once. Then the wheel returns to spot #{self._winner_next_spin}.",
+                ok=True,
             )
 
+        lb.bind("<Double-Button-1>", lambda _e: arm())
         tk.Button(
             btn_row,
             text="  Use this spot for next SPIN  ",
@@ -3292,17 +4299,11 @@ class DrawPrizeApp(tk.Tk):
                 except Exception:
                     pass
 
-    def _create_new_winner_workbook(self, base: Path, wheel_name_slug: str = "") -> Path | None:
-        """Create winners_*.xlsx with header row. If wheel_name_slug is set, file is winners_<slug>_<stamp>.xlsx."""
+    def _write_new_winner_workbook_file(self, path: Path) -> bool:
         if Workbook is None:
-            return None
-        stamp = datetime.now().strftime("%Y%m%d_%H%M%S")
-        slug = (wheel_name_slug or "").strip()
-        if slug:
-            path = base / f"winners_{slug}_{stamp}.xlsx"
-        else:
-            path = base / f"winners_{stamp}.xlsx"
+            return False
         try:
+            path.parent.mkdir(parents=True, exist_ok=True)
             wb = Workbook()
             ws = wb.active
             if ws is None:
@@ -3312,92 +4313,239 @@ class DrawPrizeApp(tk.Tk):
             ws.column_dimensions["A"].width = 10
             ws.column_dimensions["B"].width = 44
             wb.save(path)
-            return path
+            return True
         except OSError:
-            return None
+            return False
 
-    def _init_winner_session_log(self) -> None:
-        """Append to the most recent winners_*.xlsx in winner_sessions/, or create one if none exist."""
-        self._winner_next_spin = 1
-        self._winner_log_path = None
-        if Workbook is None or load_workbook is None:
-            self._log(
-                "Warning: openpyxl is not installed — session winner list disabled. "
-                "Run: py -3 -m pip install openpyxl\n"
-            )
+    def _create_new_winner_workbook(self, base: Path, wheel_name_slug: str = "") -> Path | None:
+        """Create <wheel>_winners_<Month>_<day>_<h-MMAMPM>.xlsx (Texas Central time)."""
+        if Workbook is None:
+            return None
+        slug = self._wheel_name_slug_for_filename(wheel_name_slug) or "wheel"
+        basename = self._winner_session_workbook_basename(slug)
+        path = base / f"{basename}.xlsx"
+        n = 2
+        while path.is_file():
+            path = base / f"{basename}_{n}.xlsx"
+            n += 1
+        return path if self._write_new_winner_workbook_file(path) else None
+
+    def _winner_log_path_display(self) -> str:
+        wp = getattr(self, "_winner_log_path", None)
+        if wp is not None:
+            try:
+                p = Path(wp)
+                if p.is_file():
+                    return f"Active spreadsheet: {p.name}"
+            except OSError:
+                pass
+        return "Active spreadsheet: none — choose a file before spinning"
+
+    def _refresh_winner_log_path_label(self) -> None:
+        lab = getattr(self, "_winner_log_path_label", None)
+        if lab is None:
             return
+        try:
+            if lab.winfo_exists():
+                lab.configure(text=self._winner_log_path_display())
+        except tk.TclError:
+            pass
+
+    def _attach_winner_session_path(self, path: Path) -> Path:
+        """Use a winner session workbook from persisted settings (no filename mapping)."""
+        p = path.expanduser().resolve()
+        self._winner_log_path = p
+        try:
+            self._winner_next_spin = self._next_winner_spot_from_workbook(p)
+        except Exception:
+            self._winner_next_spin = 1
+        self._clear_undo_spin()
+        self._update_spin_counter_label()
+        self._refresh_overlay_winner_session_list()
+        self._refresh_winner_log_path_label()
+        self._schedule_save_app_state()
+        return p
+
+    def _create_and_attach_winner_session_for_preset(self, wid: str) -> Path | None:
+        """Reuse an existing winner_sessions file for this wheel, or create a new one."""
+        if Workbook is None:
+            self._log(
+                f"Wheel preset {wid}: install openpyxl to create a winner spreadsheet.\n"
+            )
+            return None
         base = script_dir() / "winner_sessions"
         try:
             base.mkdir(parents=True, exist_ok=True)
         except OSError as e:
-            self._log(f"Warning: could not create winner_sessions folder: {e}\n")
-            return
+            self._log(f"Wheel preset {wid}: could not create winner_sessions folder: {e}\n")
+            return None
+        existing = self._find_existing_winner_session_for_wheel(wid, base)
+        if existing is not None:
+            self._attach_winner_session_path(existing.resolve())
+            self._log(
+                f"Winner spreadsheet for preset {wid}: reusing {existing.name} "
+                f"(next spot #{self._winner_next_spin}).\n"
+            )
+            return existing
+        slug = self._wheel_name_slug_for_filename(wid)
+        path = self._create_new_winner_workbook(base, slug)
+        if path is None:
+            self._log(f"Wheel preset {wid}: could not create a new winner spreadsheet.\n")
+            return None
+        self._attach_winner_session_path(path.resolve())
+        self._log(f"New winner spreadsheet for preset {wid}: {path.name}\n")
+        return path
 
-        latest = self._find_latest_winner_session_path(base)
-        if latest is not None:
-            try:
-                nxt = self._next_winner_spot_from_workbook(latest)
-                self._winner_log_path = latest.resolve()
-                self._winner_next_spin = nxt
-                self._log(
-                    f"Wheel log: appending to {latest.name} (next spot #{nxt}). "
-                    f"Use Start new wheel in Spin & controls when you want a new file.\n"
-                )
-                return
-            except Exception as e:
-                self._log(
-                    f"Warning: could not read latest winner file ({latest.name}); creating new sheet. {e}\n"
-                )
-
-        path = self._create_new_winner_workbook(
-            base, self._wheel_name_slug_for_filename(self._new_wheel_name_var.get())
-        )
-        if path is not None:
-            self._winner_log_path = path.resolve()
-            self._winner_next_spin = 1
-            self._log(f"Wheel log (new file): {path.name}\n")
-        else:
-            self._log("Warning: could not create session winner list.\n")
-
-    def _start_new_wheel(self) -> None:
+    def _choose_winner_session_spreadsheet(self) -> None:
+        """Pick an existing .xlsx file to receive spin / skip rows."""
         if Workbook is None or load_workbook is None:
-            messagebox.showinfo("New wheel", "Install openpyxl to save winners to Excel.")
+            messagebox.showinfo(
+                "Winner spreadsheet",
+                "Install openpyxl to use winner session Excel files.",
+            )
             return
         if getattr(self, "_backfill_target_spot", None) is not None:
             messagebox.showinfo(
-                "New wheel",
-                "Cancel \"Fill a skipped spot\" first (Cancel fill mode in Spin & controls).",
+                "Winner spreadsheet",
+                "Cancel fill-skip mode first (Cancel fill mode in Spin & controls).",
             )
             return
         if self._busy or self._pending_super is not None:
             messagebox.showinfo(
-                "New wheel",
-                "Finish or cancel the current spin (including Super / Reroll / Keep) before starting a new wheel.",
+                "Winner spreadsheet",
+                "Finish or cancel the current spin (including Super / Reroll / Keep) first.",
             )
             return
-        if not messagebox.askyesno(
-            "New wheel",
-            "Create a new Excel file for this wheel?\n\n"
-            "New spins will save there. Your current file is left on disk unchanged.",
-        ):
-            return
         base = script_dir() / "winner_sessions"
+        initial = base if base.is_dir() else script_dir()
+        wp = getattr(self, "_winner_log_path", None)
+        if wp is not None:
+            try:
+                parent = Path(wp).parent
+                if parent.is_dir():
+                    initial = parent
+            except OSError:
+                pass
+        picked = filedialog.askopenfilename(
+            title="Choose winner spreadsheet to populate",
+            initialdir=str(initial),
+            filetypes=[
+                ("Excel workbook", "*.xlsx"),
+                ("All files", "*.*"),
+            ],
+        )
+        if not picked:
+            return
+        path = Path(picked).expanduser().resolve()
+        if not path.is_file():
+            messagebox.showerror("Winner spreadsheet", "That file does not exist.")
+            return
         try:
-            base.mkdir(parents=True, exist_ok=True)
-        except OSError as e:
-            messagebox.showerror("New wheel", str(e))
+            self._next_winner_spot_from_workbook(path)
+        except Exception as e:
+            messagebox.showerror(
+                "Winner spreadsheet",
+                f"Could not read that workbook:\n{e}\n\n"
+                "Use a file with Spot # and Prize (SKU) columns (row 1 = headers).",
+            )
             return
-        slug = self._wheel_name_slug_for_filename(self._new_wheel_name_var.get())
-        path = self._create_new_winner_workbook(base, slug)
-        if path is None:
-            messagebox.showerror("New wheel", "Could not create a new workbook.")
+        self._attach_winner_session_path(path)
+        self._log(
+            f"Winner spreadsheet set to {path.name} (next spot #{self._winner_next_spin}).\n"
+        )
+        self._update_draw_buttons_for_supply()
+
+    def _collect_app_state(self) -> dict[str, str]:
+        out: dict[str, str] = {}
+        preset = (self.wheel_preset_var.get() or getattr(self, "_active_wheel_preset_id", "") or "").strip()
+        if preset:
+            out["wheel_preset_id"] = preset
+        list_raw = self.path_var.get().strip()
+        if list_raw:
+            out["list_path"] = list_raw
+        images_raw = self.images_path_var.get().strip()
+        if images_raw:
+            out["images_path"] = images_raw
+        wp = getattr(self, "_winner_log_path", None)
+        if wp is not None:
+            out["winner_log_path"] = str(Path(wp).resolve())
+        return out
+
+    def _schedule_save_app_state(self) -> None:
+        aid = getattr(self, "_app_state_save_after", None)
+        if aid is not None:
+            try:
+                self.after_cancel(aid)
+            except tk.TclError:
+                pass
+        self._app_state_save_after = self.after(350, self._flush_save_app_state)
+
+    def _flush_save_app_state(self) -> None:
+        self._app_state_save_after = None
+        self._save_app_state()
+
+    def _save_app_state(self) -> None:
+        data = self._collect_app_state()
+        if not data:
             return
-        self._winner_log_path = path.resolve()
+        if app_local_state.save_state(script_dir(), data):
+            return
+        self._log("Warning: could not save session state to energy_break_state.json\n")
+
+    def _load_app_state(self) -> bool:
+        raw = app_local_state.load_state(script_dir())
+        if not raw:
+            return False
+        restored = False
+        list_raw = str(raw.get("list_path") or "").strip()
+        if list_raw:
+            self.path_var.set(list_raw)
+            restored = True
+        images_raw = str(raw.get("images_path") or "").strip()
+        if images_raw:
+            self.images_path_var.set(images_raw)
+            restored = True
+        preset = str(raw.get("wheel_preset_id") or "").strip()
+        if preset:
+            self.wheel_preset_var.set(preset)
+            self._active_wheel_preset_id = draw_prize.normalize_wheel_id(preset)
+            restored = True
+        winner_raw = str(raw.get("winner_log_path") or "").strip()
+        preset_norm = draw_prize.normalize_wheel_id(preset) if preset else ""
+        if winner_raw:
+            wp = Path(winner_raw)
+            if wp.is_file():
+                self._attach_winner_session_path(wp)
+                restored = True
+            else:
+                self._winner_log_path = None
+                if preset_norm:
+                    self._create_and_attach_winner_session_for_preset(preset_norm)
+                    restored = True
+                else:
+                    self._log(
+                        f"Saved winner log not found ({wp.name}) — apply a preset or choose a spreadsheet.\n"
+                    )
+        elif preset_norm:
+            self._create_and_attach_winner_session_for_preset(preset_norm)
+            restored = True
+        if restored:
+            self._log("Restored last session from energy_break_state.json\n")
+            self._invalidate_session()
+            self._on_images_path_write()
+            self._refresh_setup_status()
+            self.after_idle(self._update_draw_buttons_for_supply)
+        return restored
+
+    def _init_winner_session_log(self) -> None:
+        """No winner log until restored from energy_break_state.json or a new preset is applied."""
         self._winner_next_spin = 1
-        self._update_spin_counter_label()
-        self._clear_undo_spin()
-        self._log(f"New wheel file: {path.name}\n")
-        self._refresh_overlay_winner_session_list()
+        self._winner_log_path = None
+        try:
+            (script_dir() / "winner_sessions").mkdir(parents=True, exist_ok=True)
+        except OSError:
+            pass
+        self.after_idle(self._update_draw_buttons_for_supply)
 
     def _append_winner_sheet_row(self, sku: str | None) -> bool:
         """Append a new row, or (fill-skip mode) update column B on an existing skipped row."""
@@ -3455,13 +4603,29 @@ class DrawPrizeApp(tk.Tk):
             return
         bf = getattr(self, "_backfill_target_spot", None)
         if bf is not None:
-            self.spin_counter_label.configure(text=f"Spot {bf} — fill skipped row")
+            text = f"Spot {bf} — fill skipped row"
         else:
-            nxt = self._winner_next_spin
-            self.spin_counter_label.configure(text=f"Spot {nxt}")
+            text = f"Spot {self._winner_next_spin}"
+        self.spin_counter_label.configure(text=text)
+        sc = getattr(self, "_sc_spin_counter_label", None)
+        if sc is not None:
+            try:
+                if sc.winfo_exists():
+                    sc.configure(text=text)
+            except tk.TclError:
+                pass
+        if hasattr(self, "_overlay_listbox"):
+            try:
+                self._apply_overlay_list_active_highlight()
+            except tk.TclError:
+                pass
 
     def _on_skip_spot(self) -> None:
         if self._busy:
+            return
+        block = self._winner_session_spin_block_reason()
+        if block:
+            messagebox.showinfo("Cannot skip spot", block)
             return
         if getattr(self, "_backfill_target_spot", None) is not None:
             messagebox.showinfo(
@@ -3490,14 +4654,330 @@ class DrawPrizeApp(tk.Tk):
             self._refresh_overlay_winner_session_list()
 
     def _browse(self) -> None:
+        try:
+            initial = self._list_path().parent
+        except OSError:
+            initial = script_dir()
         path = filedialog.askopenfilename(
-            title="Input list",
-            initialdir=str(script_dir()),
-            filetypes=[("Tab-separated / text", "*.txt *.tsv *.xlsx"), ("All files", "*.*")],
+            title="Step 1 — Choose your prize list file",
+            initialdir=str(initial if initial.is_dir() else script_dir()),
+            filetypes=[
+                ("Prize lists", "*.xlsx *.txt *.tsv"),
+                ("Excel workbook", "*.xlsx"),
+                ("Text / TSV", "*.txt *.tsv"),
+                ("All files", "*.*"),
+            ],
         )
         if path:
             self.path_var.set(path)
             self._invalidate_session()
+            self._refresh_setup_status()
+
+    def _open_in_explorer(self, path: Path, *, what: str) -> None:
+        target = path if path.is_dir() else path.parent
+        if not target.is_dir():
+            messagebox.showinfo(
+                what,
+                "That location does not exist yet.\n\n"
+                "Use Choose… to pick a valid file or folder first.",
+            )
+            return
+        try:
+            os.startfile(str(target))
+        except OSError as e:
+            messagebox.showerror(what, f"Could not open folder:\n{e}")
+
+    def _open_list_file_folder(self) -> None:
+        try:
+            p = self._list_path()
+        except OSError:
+            messagebox.showinfo("Prize list", "Choose a prize list file first.")
+            return
+        self._open_in_explorer(p, what="Prize list folder")
+
+    def _open_images_folder(self) -> None:
+        try:
+            p = self._images_base_path()
+        except OSError:
+            messagebox.showinfo("Images folder", "Choose an images folder first.")
+            return
+        self._open_in_explorer(p, what="Images folder")
+
+    def _setup_match_wheel_preset_from_file(self) -> None:
+        """Pick a prize list file; use its name as the preset id and apply paths."""
+        try:
+            start = self._list_path().parent
+        except OSError:
+            start = script_dir()
+        picked = filedialog.askopenfilename(
+            title="Match wheel preset from prize list file",
+            initialdir=str(start),
+            filetypes=[
+                ("Excel / prize list", "*.xlsx"),
+                ("All files", "*.*"),
+            ],
+        )
+        if not picked:
+            return
+        self._setup_apply_wheel_preset(list_file=Path(picked))
+
+    def _setup_apply_wheel_preset(self, *, list_file: Path | None = None) -> None:
+        previous_wid = draw_prize.normalize_wheel_id(
+            getattr(self, "_active_wheel_preset_id", "") or ""
+        )
+        if list_file is not None:
+            try:
+                wid, list_path, images_dir = draw_prize.wheel_preset_paths_from_list_file(list_file)
+            except draw_prize.PrizeDrawError as e:
+                messagebox.showinfo("Wheel preset", str(e))
+                return
+            self.wheel_preset_var.set(wid)
+        else:
+            raw = self.wheel_preset_var.get()
+            try:
+                list_path, images_dir = draw_prize.wheel_preset_paths(raw, script_dir())
+            except draw_prize.PrizeDrawError as e:
+                messagebox.showinfo("Wheel preset", str(e))
+                return
+            wid = draw_prize.normalize_wheel_id(raw)
+        self.path_var.set(str(list_path.resolve()))
+        self.images_path_var.set(str(images_dir.resolve()))
+        self._invalidate_session()
+        self._on_images_path_write()
+        self._refresh_setup_status()
+        self._active_wheel_preset_id = wid
+        if previous_wid != wid:
+            self._create_and_attach_winner_session_for_preset(wid)
+        wp = getattr(self, "_winner_log_path", None)
+        if wp is not None and Path(wp).is_file():
+            winner_bit = f"Winner log: {Path(wp).name}"
+        else:
+            winner_bit = "Winner log: none — install openpyxl or choose a spreadsheet"
+        missing: list[str] = []
+        if not list_path.is_file():
+            missing.append(list_path.name)
+        if not images_dir.is_dir():
+            missing.append(f"{images_dir.name}/ folder")
+        if missing:
+            missing_where = (
+                "Add them in the same folder as the prize list, then spin."
+                if list_file is not None
+                else "Add them next to the app, then spin."
+            )
+            self._log(
+                f"Wheel preset {wid}: {list_path.name} · images {images_dir.name}/ · {winner_bit} · "
+                f"not found yet: {', '.join(missing)} — {missing_where}\n"
+            )
+        else:
+            self._log(
+                f"Wheel preset {wid}: {list_path.name} + {images_dir.name}/ · {winner_bit}\n"
+            )
+        if self._setup_expanded.get():
+            self.after_idle(self._overlay_resize_for_setup)
+        self.after_idle(self._update_draw_buttons_for_supply)
+        self._schedule_save_app_state()
+
+    def _cancel_scheduled_app_state_save(self) -> None:
+        aid = getattr(self, "_app_state_save_after", None)
+        if aid is not None:
+            try:
+                self.after_cancel(aid)
+            except tk.TclError:
+                pass
+            self._app_state_save_after = None
+
+    def _setup_reset_persisted_settings(self) -> None:
+        """Delete energy_break_state.json and clear in-app session fields (no path defaults)."""
+        if self._busy or self._pending_super is not None:
+            messagebox.showinfo(
+                "Reset saved session",
+                "Finish or cancel the current spin (including Super / Reroll / Keep) first.",
+            )
+            return
+        if getattr(self, "_backfill_target_spot", None) is not None:
+            messagebox.showinfo(
+                "Reset saved session",
+                'Cancel "Fill a skipped spot" first (Cancel fill mode in Spin & controls).',
+            )
+            return
+        if not messagebox.askyesno(
+            "Reset saved session",
+            "Delete saved session data and clear this run?\n\n"
+            f"Removes {app_local_state.STATE_FILENAME} (wheel preset, file paths, winner spreadsheet).\n"
+            "Prize list and images paths are cleared (not reset to Input List / Images).\n"
+            "Prize lists, wheel presets, and winner_sessions/ files on disk are not deleted.",
+        ):
+            return
+        self._cancel_scheduled_app_state_save()
+        if not app_local_state.delete_state(script_dir()):
+            messagebox.showerror(
+                "Reset saved session",
+                f"Could not delete {app_local_state.STATE_FILENAME}.",
+            )
+            return
+        self.wheel_preset_var.set("")
+        self._active_wheel_preset_id = ""
+        self.path_var.set("")
+        self.images_path_var.set("")
+        self._winner_log_path = None
+        self._winner_next_spin = 1
+        self._clear_undo_spin()
+        self._update_spin_counter_label()
+        self._refresh_winner_log_path_label()
+        self._refresh_overlay_winner_session_list()
+        self._invalidate_session()
+        self._on_images_path_write()
+        self._refresh_setup_status()
+        self._update_draw_buttons_for_supply()
+        if self._setup_expanded.get():
+            self.after_idle(self._overlay_resize_for_setup)
+        self._cancel_scheduled_app_state_save()
+        app_local_state.delete_state(script_dir())
+        self._log(
+            f"Saved session cleared ({app_local_state.STATE_FILENAME} deleted). "
+            "Apply a wheel preset or set prize list, images folder, and winner spreadsheet before spinning.\n"
+        )
+        messagebox.showinfo(
+            "Reset saved session",
+            "Session memory cleared. Set paths in Show setup or apply a wheel preset before spinning.",
+        )
+
+    def _refresh_setup_status(self) -> None:
+        if not hasattr(self, "_setup_list_status"):
+            return
+        ok_fg = "#86efac"
+        warn_fg = WHEEL_POINTER
+        bad_fg = WHEEL_ACCENT
+
+        try:
+            p = self._list_path()
+        except OSError:
+            p = None
+        if p is None or not p.is_file():
+            list_raw = self.path_var.get().strip() if hasattr(self, "path_var") else ""
+            if not list_raw:
+                list_msg = "⚠ Prize list not set — apply a wheel preset or choose a prize list."
+            else:
+                list_msg = "⚠ Prize list not found — click Choose prize list… or apply a wheel preset."
+            self._setup_list_status.configure(text=list_msg, fg=warn_fg)
+        else:
+            try:
+                _, rows = draw_prize.load_rows(p)
+                types_n = len(rows)
+                units = sum(q for _, q, _ in rows)
+                in_draw = sum(q for _, q, _ in rows if q > 0)
+                self._setup_list_status.configure(
+                    text=(
+                        f"✓ Found: {p.name}  ·  {types_n} prize type(s)  ·  "
+                        f"{units} total qty  ·  {in_draw} left to draw"
+                    ),
+                    fg=ok_fg,
+                )
+            except draw_prize.PrizeDrawError as e:
+                self._setup_list_status.configure(
+                    text=f"⚠ Could not read list: {e}",
+                    fg=bad_fg,
+                )
+            except OSError as e:
+                self._setup_list_status.configure(
+                    text=f"⚠ Could not read list: {e}",
+                    fg=bad_fg,
+                )
+
+        images_raw = self.images_path_var.get().strip() if hasattr(self, "images_path_var") else ""
+        if not images_raw:
+            self._setup_images_status.configure(
+                text="⚠ Images folder not set — apply a wheel preset or choose an images folder.",
+                fg=warn_fg,
+            )
+            return
+        try:
+            img_base = self._images_base_path()
+        except OSError:
+            self._setup_images_status.configure(
+                text="⚠ Images folder not set — apply a wheel preset or choose an images folder.",
+                fg=warn_fg,
+            )
+            return
+        if not img_base.is_dir():
+            self._setup_images_status.configure(
+                text="⚠ Images folder not found — click Choose images folder…",
+                fg=warn_fg,
+            )
+            return
+        exts = {".jpg", ".jpeg", ".png", ".gif", ".webp", ".bmp"}
+        try:
+            n_img = sum(
+                1
+                for f in img_base.iterdir()
+                if f.is_file() and f.suffix.lower() in exts
+            )
+        except OSError:
+            n_img = 0
+        sample = ""
+        try:
+            names = sorted(
+                f.name for f in img_base.iterdir() if f.is_file() and f.suffix.lower() in exts
+            )[:3]
+            if names:
+                sample = "  e.g. " + ", ".join(names)
+                if n_img > 3:
+                    sample += ", …"
+        except OSError:
+            pass
+        if n_img == 0:
+            self._setup_images_status.configure(
+                text=f"⚠ Folder exists but no .jpg/.png images found in {img_base.name}{sample}",
+                fg=warn_fg,
+            )
+        else:
+            self._setup_images_status.configure(
+                text=f"✓ {n_img} image file(s) in {img_base.name}{sample}",
+                fg=ok_fg,
+            )
+
+    def _images_base_path(self) -> Path:
+        """Folder used to resolve relative img paths from the prize list (e.g. images/GrassEnergy.jpg)."""
+        if hasattr(self, "images_path_var"):
+            raw = self.images_path_var.get().strip()
+            if not raw:
+                raise OSError("Images folder path is not set")
+            try:
+                p = Path(raw).expanduser()
+                if p.is_dir():
+                    return p.resolve()
+            except OSError:
+                pass
+            raise OSError("Images folder path is not set")
+        fallback = script_dir() / "Images"
+        return fallback.resolve() if fallback.is_dir() else script_dir().resolve()
+
+    def _browse_images(self) -> None:
+        try:
+            initial = self._images_base_path()
+        except OSError:
+            initial = script_dir()
+        path = filedialog.askdirectory(
+            title="Step 2 — Choose the folder with prize pictures",
+            initialdir=str(initial if initial.is_dir() else script_dir()),
+            mustexist=True,
+        )
+        if path:
+            self.images_path_var.set(path)
+            self._on_images_path_write()
+
+    def _on_images_path_write(self, *_args: object) -> None:
+        self._wheel_image_cache.clear()
+        self._inventory_image_cache.clear()
+        self._maybe_refresh_idle_wheel()
+        if getattr(self, "remaining_inner", None) is not None:
+            try:
+                if self.remaining_inner.winfo_exists():
+                    self._refresh_remaining_skus_panel()
+            except tk.TclError:
+                pass
+        self._refresh_setup_status()
+        self._schedule_save_app_state()
 
     def _invalidate_session(self) -> None:
         self._session = None
@@ -3520,10 +5000,12 @@ class DrawPrizeApp(tk.Tk):
         try:
             list_base = self._list_path().parent
             app_base = script_dir()
+            images_base = self._images_base_path()
         except OSError:
             return None
         ref_path = Path(refn)
         rel_join = _path_for_project_join(refn)
+        file_name = Path(rel_join).name
         candidates: list[Path] = []
         seen: set[str] = set()
 
@@ -3538,6 +5020,9 @@ class DrawPrizeApp(tk.Tk):
 
         if ref_path.is_absolute():
             add_candidate(ref_path.expanduser().resolve())
+        add_candidate(images_base / rel_join)
+        if file_name and file_name != rel_join:
+            add_candidate(images_base / file_name)
         add_candidate((list_base / rel_join).resolve())
         add_candidate((app_base / rel_join).resolve())
         add_candidate((Path.cwd() / rel_join).resolve())
@@ -3686,7 +5171,14 @@ class DrawPrizeApp(tk.Tk):
         self._busy = busy
         if busy:
             self._cancel_wheel_idle_drift()
-        self.path_entry.state(["disabled"] if busy else ["!disabled"])
+        entry_state = tk.DISABLED if busy else tk.NORMAL
+        for ent_name in ("path_entry", "images_path_entry"):
+            ent = getattr(self, ent_name, None)
+            if ent is not None:
+                try:
+                    ent.configure(state=entry_state)
+                except tk.TclError:
+                    pass
         if busy:
             if hasattr(self, "spin_btn"):
                 self._btn_set_busy(self.spin_btn, True)
@@ -3700,14 +5192,14 @@ class DrawPrizeApp(tk.Tk):
         elif self._pending_super is not None:
             self._style_super_controls_active()
         else:
-            self._style_main_controls_idle()
+            self._update_draw_buttons_for_supply()
         self._sync_undo_spin_button()
 
     def _hide_super_panel(self) -> None:
         self._pending_super = None
         self._super_reroll_used = False
         if not self._busy:
-            self._style_main_controls_idle()
+            self._update_draw_buttons_for_supply()
 
     def _show_super_panel(self, session: draw_prize.FileDrawSession, result: draw_prize.SpinResult) -> None:
         self._pending_super = (session, result)
@@ -3756,10 +5248,14 @@ class DrawPrizeApp(tk.Tk):
     def _on_spin(self) -> None:
         if self._busy:
             return
+        block = self._winner_session_spin_block_reason()
+        if block:
+            messagebox.showinfo("Cannot spin", block)
+            return
         self._hide_super_panel()
         self._set_busy(True)
         self._cancel_pulse()
-        self.wheel_status.configure(text="Loading picks from your list…", fg=WHEEL_TITLE)
+        self._set_wheel_status("Loading picks from your list…", WHEEL_TITLE)
         self._wheel_loading_preview_setup()
 
         def ok(
@@ -3807,15 +5303,12 @@ class DrawPrizeApp(tk.Tk):
                             uq = self._winnable_units_total()
                             if uq is not None and uq == 0:
                                 last = "  ·  That was the last prize — list is empty."
-                            self.wheel_status.configure(
-                                text=f"Winner: {r.sku}",
-                                fg=WHEEL_POINTER,
-                            )
+                            self._set_wheel_status(f"Winner: {r.sku}", WHEEL_POINTER)
                             self._pulse_wheel_win()
                         else:
-                            self.wheel_status.configure(
-                                text=f"{r.sku}  ·  dry run (file unchanged), was Qty {r.qty}",
-                                fg=WHEEL_TITLE,
+                            self._set_wheel_status(
+                                f"{r.sku}  ·  dry run (file unchanged), was Qty {r.qty}",
+                                WHEEL_TITLE,
                             )
 
                 if dry:
@@ -3852,6 +5345,10 @@ class DrawPrizeApp(tk.Tk):
     def _on_super_spin(self) -> None:
         if self._busy:
             return
+        block = self._winner_session_spin_block_reason()
+        if block:
+            messagebox.showinfo("Cannot super spin", block)
+            return
         if getattr(self, "_backfill_target_spot", None) is not None:
             messagebox.showinfo(
                 "Super spin",
@@ -3861,7 +5358,7 @@ class DrawPrizeApp(tk.Tk):
         self._hide_super_panel()
         self._set_busy(True)
         self._cancel_pulse()
-        self.wheel_status.configure(text="Super spin — loading picks…", fg=WHEEL_TITLE)
+        self._set_wheel_status("Super spin — loading picks…", WHEEL_TITLE)
         self._wheel_loading_preview_setup()
 
         def ok(
@@ -3873,10 +5370,7 @@ class DrawPrizeApp(tk.Tk):
                 self._show_super_panel(session, r)
                 self._set_busy(False)
                 self._log(f"Super spin result: {r.sku}  (was Qty {r.qty})\n")
-                self.wheel_status.configure(
-                    text=f"Keep or Reroll!",
-                    fg=WHEEL_FG,
-                )
+                self._set_wheel_status("Keep or Reroll!", WHEEL_FG)
 
             self._run_wheel_spin(
                 rows,
@@ -3908,7 +5402,7 @@ class DrawPrizeApp(tk.Tk):
             return
         self._set_busy(True)
         self._cancel_pulse()
-        self.wheel_status.configure(text="Rerolling — loading picks…", fg=WHEEL_TITLE)
+        self._set_wheel_status("Rerolling — loading picks…", WHEEL_TITLE)
         self._wheel_loading_preview_setup()
 
         def ok(
@@ -3921,9 +5415,9 @@ class DrawPrizeApp(tk.Tk):
                 self._show_super_panel(s, r)
                 self._set_busy(False)
                 self._log(f"Reroll: {r.sku}  (was Qty {r.qty})\n")
-                self.wheel_status.configure(
-                    text=f"No more rerolls — KEEP to save −1. Pointer: {r.sku}  ·  qty {r.qty}",
-                    fg=WHEEL_FG,
+                self._set_wheel_status(
+                    f"No more rerolls — KEEP to save −1. Pointer: {r.sku}  ·  qty {r.qty}",
+                    WHEEL_FG,
                 )
 
             self._run_wheel_spin(
@@ -3981,16 +5475,16 @@ class DrawPrizeApp(tk.Tk):
                     uq = self._winnable_units_total()
                     if uq is not None and uq == 0:
                         last = "  ·  That was the last prize — list is empty."
-                    self.wheel_status.configure(
-                        text=f"Kept: {result.sku}  ·  was {result.qty}  →  now {max(0, result.qty - 1)}{last}",
-                        fg=WHEEL_POINTER,
+                    self._set_wheel_status(
+                        f"Kept: {result.sku}  ·  was {result.qty}  →  now {max(0, result.qty - 1)}{last}",
+                        WHEEL_POINTER,
                     )
                     self._pulse_wheel_win()
                 else:
                     self._log("Dry run: file not updated.\n")
-                    self.wheel_status.configure(
-                        text=f"{result.sku}  ·  dry run — qty still {result.qty} on file",
-                        fg=WHEEL_TITLE,
+                    self._set_wheel_status(
+                        f"{result.sku}  ·  dry run — qty still {result.qty} on file",
+                        WHEEL_TITLE,
                     )
 
         if dry:
@@ -4010,7 +5504,141 @@ def _close_fill_skipped_dialog(top: tk.Toplevel) -> None:
         pass
 
 
+_SINGLE_INSTANCE_LOCK: object | None = None
+_SINGLE_INSTANCE_MUTEX_NAME = "Global\\EnergyBreakSystem.SingleInstance.v1"
+_ALREADY_RUNNING_TITLE = "Energy Break"
+_ALREADY_RUNNING_MSG = (
+    "Energy Break is already running.\n\n"
+    "Close the other window first. If you do not see it, check Task Manager for "
+    "python.exe or Energy Break, then try again.\n\n"
+    "Only one copy can run so the HTML/OBS wheel port (8765) stays in sync."
+)
+
+
+def _focus_existing_energy_break_window() -> None:
+    """Best-effort: bring the first instance to the foreground (Windows)."""
+    if sys.platform != "win32":
+        return
+    try:
+        import ctypes
+
+        user32 = ctypes.windll.user32
+        for title in ("Energy Break — Overlay", "Energy Break — Spin & controls"):
+            hwnd = user32.FindWindowW(None, title)
+            if hwnd:
+                user32.ShowWindow(hwnd, 9)  # SW_RESTORE
+                user32.SetForegroundWindow(hwnd)
+                return
+    except Exception:
+        pass
+
+
+def _show_already_running_message() -> None:
+    if sys.platform == "win32":
+        try:
+            import ctypes
+
+            ctypes.windll.user32.MessageBoxW(
+                None,
+                _ALREADY_RUNNING_MSG,
+                _ALREADY_RUNNING_TITLE,
+                0x40,
+            )
+            return
+        except Exception:
+            pass
+    root = tk.Tk()
+    root.withdraw()
+    try:
+        messagebox.showinfo(_ALREADY_RUNNING_TITLE, _ALREADY_RUNNING_MSG, parent=root)
+    finally:
+        root.destroy()
+
+
+def _acquire_single_instance_lock() -> bool:
+    """
+    Return True if this process is the only Energy Break instance.
+
+    Uses a Windows named mutex when available; otherwise a non-blocking lock file.
+    """
+    global _SINGLE_INSTANCE_LOCK
+    if _SINGLE_INSTANCE_LOCK is not None:
+        return True
+
+    if sys.platform == "win32":
+        try:
+            import ctypes
+
+            kernel32 = ctypes.WinDLL("kernel32", use_last_error=True)
+            kernel32.CreateMutexW.argtypes = [
+                ctypes.c_void_p,
+                ctypes.c_bool,
+                ctypes.c_wchar_p,
+            ]
+            kernel32.CreateMutexW.restype = ctypes.c_void_p
+            kernel32.CloseHandle.argtypes = [ctypes.c_void_p]
+            kernel32.CloseHandle.restype = ctypes.c_bool
+
+            handle = kernel32.CreateMutexW(None, True, _SINGLE_INSTANCE_MUTEX_NAME)
+            if not handle:
+                return True
+            if ctypes.get_last_error() == 183:  # ERROR_ALREADY_EXISTS
+                kernel32.CloseHandle(handle)
+                return False
+            _SINGLE_INSTANCE_LOCK = handle
+            return True
+        except Exception:
+            pass
+
+    import tempfile
+
+    lock_path = Path(tempfile.gettempdir()) / "energy-break-system.lock"
+    try:
+        fh = open(lock_path, "a+b")
+    except OSError:
+        return True
+    try:
+        if sys.platform == "win32":
+            import msvcrt
+
+            fh.seek(0)
+            try:
+                msvcrt.locking(fh.fileno(), msvcrt.LK_NBLCK, 1)
+            except OSError:
+                fh.close()
+                return False
+        else:
+            import fcntl
+
+            try:
+                fcntl.flock(fh.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
+            except OSError:
+                fh.close()
+                return False
+        fh.seek(0)
+        fh.truncate()
+        fh.write(str(os.getpid()).encode("ascii"))
+        fh.flush()
+        _SINGLE_INSTANCE_LOCK = fh
+        return True
+    except Exception:
+        try:
+            fh.close()
+        except OSError:
+            pass
+        return True
+
+
+def _ensure_single_instance() -> None:
+    if _acquire_single_instance_lock():
+        return
+    _focus_existing_energy_break_window()
+    _show_already_running_message()
+    raise SystemExit(0)
+
+
 def main() -> None:
+    _ensure_single_instance()
     app = DrawPrizeApp()
     app.mainloop()
 

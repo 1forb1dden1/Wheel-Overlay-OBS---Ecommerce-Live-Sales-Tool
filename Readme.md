@@ -95,5 +95,5 @@ Use Case: If you accidently clicked fill mode and you need to cancel it, use thi
 
 **10 — OBS (optional)**  
 
-1. Copy the **`http://127.0.0.1:`…** URL from **Show setup** → **Show event log** (printed when the app starts).  
-2. Paste it into an OBS **Browser** source — that screen tracks the wheel live.
+1. In OBS, add a **Browser** source with URL **`http://127.0.0.1:8765/`** (fixed port every run).
+2. Start Energy Break before streaming — the app serves that page on localhost. Check the event log if the port was busy (a different port may be used).
